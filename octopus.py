@@ -38,8 +38,8 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
 MAX_WORKERS = 16
-LEVERAGE = 20
-TEST_ASSET_LIMIT = 5  # Limit execution to 4 assets for testing
+LEVERAGE = 10
+TEST_ASSET_LIMIT = 4  # Limit execution to 4 assets for testing
 
 # Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
@@ -144,6 +144,7 @@ class OctopusGridBot:
                     # API usually expects lowercase symbols for order management
                     self.kf.cancel_all_orders({"symbol": sym.lower()})
                     bot_log(f"Cancelled orders for {sym}")
+                    time.sleep(0.5) # Added sleep to prevent apiLimitExceeded
                 except Exception as e:
                     bot_log(f"Failed to cancel {sym}: {e}", level="warning")
                     
