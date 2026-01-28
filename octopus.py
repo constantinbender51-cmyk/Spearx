@@ -39,7 +39,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 # Global Settings
 MAX_WORKERS = 16
 LEVERAGE = 10
-TEST_ASSET_LIMIT = 10  # Limit execution to 4 assets for testing
+TEST_ASSET_LIMIT = 4  # Limit execution to 4 assets for testing
 
 # Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
@@ -98,8 +98,6 @@ class GridParamFetcher:
                 if isinstance(data, dict):
                     valid_strategies = {}
                     for sym, params in data.items():
-                        # We use try/except here so if one item is a float (causing TypeError),
-                        # we skip ONLY that item, not the whole loop.
                         try:
                             if "line_prices" in params and "stop_percent" in params:
                                 valid_strategies[sym] = params
@@ -137,8 +135,20 @@ class OctopusGridBot:
                 sys.exit(1)
             else:
                 bot_log("API Connection Successful.")
+
+            # --- 1. Cancel All Orders on Startup ---
+            bot_log("Startup: Canceling all open orders for mapped assets...")
+            unique_symbols = set(SYMBOL_MAP.values())
+            for sym in unique_symbols:
+                try:
+                    # API usually expects lowercase symbols for order management
+                    self.kf.cancel_all_orders({"symbol": sym.lower()})
+                    bot_log(f"Cancelled orders for {sym}")
+                except Exception as e:
+                    bot_log(f"Failed to cancel {sym}: {e}", level="warning")
+                    
         except Exception as e:
-            bot_log(f"API Connection Failed: {e}", level="error")
+            bot_log(f"Startup Failed: {e}", level="error")
             sys.exit(1)
 
     def _fetch_instrument_specs(self):
@@ -227,7 +237,6 @@ class OctopusGridBot:
             return
 
         # 3. Determine Execution Size per Asset (TESTING LIMIT APPLIED HERE)
-        # We filter the dictionary down to the first TEST_ASSET_LIMIT items
         limited_keys = list(all_params.keys())[:TEST_ASSET_LIMIT]
         limited_params = {k: all_params[k] for k in limited_keys}
         
@@ -239,7 +248,6 @@ class OctopusGridBot:
         
         # 4. Execute Logic for Each Asset
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # We iterate over limited_params instead of all_params
             for app_symbol, params in limited_params.items():
                 kraken_symbol = SYMBOL_MAP.get(app_symbol)
                 
@@ -321,9 +329,11 @@ class OctopusGridBot:
             try:
                 open_orders = self.kf.get_open_orders().get("openOrders", [])
                 for o in open_orders:
-                    # Convert API symbol to lowercase for robust check
                     if o["symbol"].lower() == symbol_lower and o["orderType"] == "lmt":
-                        self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
+                        # We cancel basic limits, but keep Take Profits (if they are type 'lmt' with reduceOnly)
+                        # The check below handles TP existence. For now, strict cleanup of old grid orders:
+                        if not o.get("reduceOnly", False):
+                            self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
             except Exception as e:
                 bot_log(f"[{symbol_upper}] Cleanup error: {e}", level="warning")
 
@@ -333,9 +343,11 @@ class OctopusGridBot:
             try:
                 open_orders = self.kf.get_open_orders().get("openOrders", [])
                 for o in open_orders:
-                    # Convert API symbol to lowercase for robust check
                     if o["symbol"].lower() == symbol_lower:
-                        if o["orderType"] == "stp": has_sl = True
+                        # Check for STP or STPLMT
+                        if o["orderType"] in ["stp", "stplmt"]: has_sl = True
+                        # Check for TP (using LMT + reduceOnly)
+                        if o["orderType"] == "lmt" and o.get("reduceOnly", False): has_tp = True
                         if o["orderType"] == "take_profit": has_tp = True
             except: pass
 
@@ -360,27 +372,32 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] Adding Brackets | Entry: {entry_price} | SL: {sl_price} | TP: {tp_price}")
 
+        # STOP LOSS: 'stp' type but WITH limitPrice as requested
         try:
-            self.kf.send_order({
+            sl_resp = self.kf.send_order({
                 "orderType": "stp", 
                 "symbol": symbol, 
                 "side": side, 
                 "size": abs_size, 
                 "stopPrice": sl_price, 
+                "limitPrice": sl_price, # Added limitPrice to prevent rejection
                 "reduceOnly": True
             })
+            print(f"DEBUG_SL_RESPONSE [{symbol.upper()}]: {sl_resp}")
         except Exception as e:
             bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
 
+        # TAKE PROFIT: 'lmt' type with limitPrice
         try:
-            self.kf.send_order({
-                "orderType": "take_profit", 
+            tp_resp = self.kf.send_order({
+                "orderType": "lmt", 
                 "symbol": symbol, 
                 "side": side, 
                 "size": abs_size, 
-                "stopPrice": tp_price, 
+                "limitPrice": tp_price, 
                 "reduceOnly": True
             })
+            print(f"DEBUG_TP_RESPONSE [{symbol.upper()}]: {tp_resp}")
         except Exception as e:
             bot_log(f"[{symbol.upper()}] TP Failed: {e}", level="error")
 
