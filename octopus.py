@@ -5,7 +5,6 @@ Octopus Grid: Execution Engine for GA Grid Strategy
 - Logic: Grid Entry (Nearest Lines) + Dynamic SL/TP
 - Schedule: Every 1 minute
 - Assets: Multi-Asset Support (Maps app.py symbols to Kraken Futures)
-- Optimization: Bulk Data Fetching (Tickers & Positions)
 """
 
 import os
@@ -17,7 +16,7 @@ import threading
 import numpy as np
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Tuple, Any, List, Optional
+from typing import Dict, Tuple, Any, List
 
 # --- Local Imports ---
 try:
@@ -38,7 +37,7 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-MAX_WORKERS = 5
+MAX_WORKERS = 16
 LEVERAGE = 10
 
 # Strategy Endpoint (The app.py server)
@@ -162,44 +161,35 @@ class OctopusGridBot:
 
     def _round_to_step(self, value: float, step: float) -> float:
         if step == 0: return value
-        # Standardize precision to avoid floating point artifacts (e.g. 7.82053e-06)
         rounded = round(value / step) * step
         return float(f"{rounded:.10g}")
 
-    # --- Bulk Data Fetching Methods (Optimized) ---
-
-    def _fetch_all_tickers(self) -> Dict[str, float]:
-        """Fetches all tickers once and returns a map of {Symbol: Price}"""
-        try:
-            tickers = self.kf.get_tickers()
-            price_map = {}
-            if "tickers" in tickers:
-                for t in tickers["tickers"]:
-                    sym = t.get("symbol", "").upper()
-                    price = float(t.get("markPrice", 0.0))
-                    price_map[sym] = price
-            return price_map
-        except Exception as e:
-            bot_log(f"Bulk Ticker Fetch Error: {e}", level="error")
-            return {}
-
-    def _fetch_all_positions(self) -> Dict[str, Tuple[float, float]]:
-        """Fetches all positions once and returns a map of {Symbol: (Size, EntryPrice)}"""
+    def _get_position_details(self, kf_symbol_upper: str) -> Tuple[float, float]:
+        """Returns (size, avgEntryPrice)"""
         try:
             open_pos = self.kf.get_open_positions()
-            pos_map = {}
             if "openPositions" in open_pos:
                 for p in open_pos["openPositions"]:
-                    sym = p.get("symbol", "").upper()
-                    size = float(p.get("size", 0.0))
-                    if p.get("side") == "short": 
-                        size = -size
-                    entry = float(p.get("price", 0.0))
-                    pos_map[sym] = (size, entry)
-            return pos_map
+                    if p["symbol"].upper() == kf_symbol_upper:
+                        size = float(p["size"])
+                        if p["side"] == "short": size = -size
+                        entry = float(p["price"])
+                        return size, entry
+            return 0.0, 0.0
         except Exception as e:
-            bot_log(f"Bulk Position Fetch Error: {e}", level="error")
-            return {}
+            bot_log(f"[{kf_symbol_upper}] Position Fetch Error: {e}", level="error")
+            return 0.0, 0.0
+
+    def _get_mark_price(self, kf_symbol_upper: str) -> float:
+        try:
+            tickers = self.kf.get_tickers()
+            for t in tickers.get("tickers", []):
+                if t["symbol"].upper() == kf_symbol_upper:
+                    return float(t["markPrice"])
+            return 0.0
+        except Exception as e:
+            bot_log(f"[{kf_symbol_upper}] Ticker Fetch Error: {e}", level="error")
+            return 0.0
 
     def run(self):
         bot_log("Bot started. Syncing to 1m intervals...")
@@ -235,16 +225,11 @@ class OctopusGridBot:
             bot_log(f"Account fetch failed: {e}", level="error")
             return
 
-        # 3. Snapshot Market Data (OPTIMIZED: 2 Calls instead of 30+)
-        bot_log("Snapshotting Market Data (Tickers & Positions)...")
-        global_tickers = self._fetch_all_tickers()
-        global_positions = self._fetch_all_positions()
-
-        # 4. Determine Execution Size per Asset
+        # 3. Determine Execution Size per Asset
         active_assets_count = len(all_params)
         if active_assets_count == 0: return
         
-        # 5. Execute Logic for Each Asset
+        # 4. Execute Logic for Each Asset
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             for app_symbol, params in all_params.items():
                 kraken_symbol = SYMBOL_MAP.get(app_symbol)
@@ -253,35 +238,18 @@ class OctopusGridBot:
                     bot_log(f"Skipping {app_symbol}: No Kraken mapping found.", level="warning")
                     continue
                 
-                # Extract specific data for this asset from the global snapshots
-                current_price = global_tickers.get(kraken_symbol, 0.0)
-                # Default to (0.0, 0.0) if no position found
-                pos_details = global_positions.get(kraken_symbol, (0.0, 0.0))
-
                 executor.submit(
                     self._execute_grid_logic, 
                     kraken_symbol, 
                     equity, 
                     params, 
-                    active_assets_count,
-                    current_price,
-                    pos_details
+                    active_assets_count
                 )
 
-    def _execute_grid_logic(self, symbol_str: str, equity: float, params: Dict, asset_count: int, 
-                            current_price: float, pos_details: Tuple[float, float]):
-        
+    def _execute_grid_logic(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
         symbol_upper = symbol_str.upper()
         symbol_lower = symbol_str.lower()
         
-        # Unpack position details from the passed snapshot
-        pos_size, entry_price = pos_details
-
-        # Validate Price
-        if current_price == 0: 
-            bot_log(f"[{symbol_upper}] Aborting: Price is 0.0 (Data missing).", level="error")
-            return
-
         grid_lines = np.sort(np.array(params["line_prices"]))
         stop_pct = params["stop_percent"]
         profit_pct = params["profit_percent"]
@@ -290,6 +258,11 @@ class OctopusGridBot:
         if not specs: 
             bot_log(f"No specs for {symbol_upper} - skipping.", level="error")
             return
+
+        pos_size, entry_price = self._get_position_details(symbol_upper)
+        current_price = self._get_mark_price(symbol_upper)
+        
+        if current_price == 0: return
 
         is_flat = abs(pos_size) < specs["sizeStep"]
         
@@ -336,8 +309,6 @@ class OctopusGridBot:
 
         else:
             # --- IN POSITION: Manage Exits ---
-            # NOTE: We still fetch open orders individually because order status is dynamic,
-            # but this is less frequent than ticker fetching.
             try:
                 open_orders = self.kf.get_open_orders().get("openOrders", [])
                 for o in open_orders:
@@ -350,7 +321,6 @@ class OctopusGridBot:
             has_tp = False
             
             try:
-                # Re-fetch orders to check for existing SL/TP
                 open_orders = self.kf.get_open_orders().get("openOrders", [])
                 for o in open_orders:
                     if o["symbol"] == symbol_lower:
