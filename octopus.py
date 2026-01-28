@@ -37,8 +37,8 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-MAX_WORKERS = 5
-LEVERAGE = 1
+MAX_WORKERS = 16
+LEVERAGE = 10
 
 # Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
