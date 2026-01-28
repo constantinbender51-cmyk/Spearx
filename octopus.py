@@ -39,7 +39,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 # Global Settings
 MAX_WORKERS = 16
 LEVERAGE = 20
-TEST_ASSET_LIMIT = 100  # Limit execution to 4 assets for testing
+TEST_ASSET_LIMIT = 5  # Limit execution to 4 assets for testing
 
 # Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
