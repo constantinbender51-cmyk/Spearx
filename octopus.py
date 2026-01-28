@@ -38,7 +38,7 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-MAX_WORKERS = 16
+MAX_WORKERS = 5
 LEVERAGE = 10
 
 # Strategy Endpoint (The app.py server)
