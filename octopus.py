@@ -227,19 +227,16 @@ class OctopusGridBot:
             return
 
         # 3. Determine Execution Size per Asset (TESTING LIMIT APPLIED HERE)
-        # We filter the dictionary down to the first TEST_ASSET_LIMIT items
         limited_keys = list(all_params.keys())[:TEST_ASSET_LIMIT]
         limited_params = {k: all_params[k] for k in limited_keys}
         
         active_assets_count = len(limited_params)
-        
         bot_log(f"TEST MODE: Limiting active assets to {active_assets_count}: {limited_keys}")
         
         if active_assets_count == 0: return
         
         # 4. Execute Logic for Each Asset
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # We iterate over limited_params instead of all_params
             for app_symbol, params in limited_params.items():
                 kraken_symbol = SYMBOL_MAP.get(app_symbol)
                 
@@ -277,110 +274,140 @@ class OctopusGridBot:
         
         bot_log(f"[{symbol_upper}] Price: {current_price} | Pos: {pos_size} @ {entry_price}")
 
+        # --- RECONCILIATION LOGIC ---
+        
+        # 1. Define Desired Orders
+        desired_orders = [] # List of dicts with keys: orderType, side, size, price, reduceOnly
+
         if is_flat:
-            # --- FLAT: Place Grid Entry Orders ---
+            # FLAT: We want 2 LMT orders (Buy Below, Sell Above)
             idx = np.searchsorted(grid_lines, current_price)
             line_below = grid_lines[idx-1] if idx > 0 else None
             line_above = grid_lines[idx] if idx < len(grid_lines) else None
             
-            # Split Equity Logic
+            # Calc Size
             safe_equity = equity * 0.95
             allocation_per_asset = safe_equity / max(1, asset_count)
             unit_usd = (allocation_per_asset * LEVERAGE) * 0.20 
-            
             qty = unit_usd / current_price
             qty = self._round_to_step(qty, specs["sizeStep"])
 
-            if qty < specs["sizeStep"]:
-                bot_log(f"[{symbol_upper}] Qty too small ({qty}).", level="warning")
-                return
-
-            try: self.kf.cancel_all_orders({"symbol": symbol_lower})
-            except: pass
-            
-            if line_below:
-                price = self._round_to_step(line_below, specs["tickSize"])
-                if price < current_price:
-                    bot_log(f"[{symbol_upper}] Placing BUY LMT @ {price} (Qty: {qty})")
-                    self.kf.send_order({
-                        "orderType": "lmt", "symbol": symbol_lower, "side": "buy",
-                        "size": qty, "limitPrice": price
-                    })
-            
-            if line_above:
-                price = self._round_to_step(line_above, specs["tickSize"])
-                if price > current_price:
-                    bot_log(f"[{symbol_upper}] Placing SELL LMT @ {price} (Qty: {qty})")
-                    self.kf.send_order({
-                        "orderType": "lmt", "symbol": symbol_lower, "side": "sell",
-                        "size": qty, "limitPrice": price
-                    })
+            if qty >= specs["sizeStep"]:
+                # Desired Buy LMT
+                if line_below:
+                    p = self._round_to_step(line_below, specs["tickSize"])
+                    if p < current_price:
+                        desired_orders.append({
+                            "orderType": "lmt", "side": "buy", "size": qty, 
+                            "price": p, "reduceOnly": False
+                        })
+                # Desired Sell LMT
+                if line_above:
+                    p = self._round_to_step(line_above, specs["tickSize"])
+                    if p > current_price:
+                        desired_orders.append({
+                            "orderType": "lmt", "side": "sell", "size": qty, 
+                            "price": p, "reduceOnly": False
+                        })
+            else:
+                bot_log(f"[{symbol_upper}] Calculated Qty too small ({qty}).", level="warning")
 
         else:
-            # --- IN POSITION: Manage Exits ---
-            try:
-                open_orders = self.kf.get_open_orders().get("openOrders", [])
-                for o in open_orders:
-                    if o["symbol"] == symbol_lower and o["orderType"] == "lmt":
-                        self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
-            except Exception as e:
-                bot_log(f"[{symbol_upper}] Cleanup error: {e}", level="warning")
-
-            has_sl = False
-            has_tp = False
+            # IN POSITION: We want 1 SL and 1 TP (Bracket)
+            is_long = pos_size > 0
+            exit_side = "sell" if is_long else "buy"
+            abs_size = abs(pos_size)
             
-            try:
-                open_orders = self.kf.get_open_orders().get("openOrders", [])
-                for o in open_orders:
-                    if o["symbol"] == symbol_lower:
-                        if o["orderType"] == "stp": has_sl = True
-                        if o["orderType"] == "take_profit": has_tp = True
-            except: pass
+            # SL Price
+            sl_raw = entry_price * (1 - stop_pct) if is_long else entry_price * (1 + stop_pct)
+            sl_price = self._round_to_step(sl_raw, specs["tickSize"])
+            
+            # TP Price
+            tp_raw = entry_price * (1 + profit_pct) if is_long else entry_price * (1 - profit_pct)
+            tp_price = self._round_to_step(tp_raw, specs["tickSize"])
 
-            if not has_sl or not has_tp:
-                self._place_bracket_orders(symbol_lower, pos_size, entry_price, stop_pct, profit_pct, specs["tickSize"])
-
-    def _place_bracket_orders(self, symbol: str, position_size: float, entry_price: float, 
-                              sl_pct: float, tp_pct: float, tick_size: float):
-        is_long = position_size > 0
-        side = "sell" if is_long else "buy"
-        abs_size = abs(position_size)
-
-        if is_long:
-            sl_price = entry_price * (1 - sl_pct)
-            tp_price = entry_price * (1 + tp_pct)
-        else:
-            sl_price = entry_price * (1 + sl_pct)
-            tp_price = entry_price * (1 - tp_pct)
-
-        sl_price = self._round_to_step(sl_price, tick_size)
-        tp_price = self._round_to_step(tp_price, tick_size)
-
-        bot_log(f"[{symbol.upper()}] Adding Brackets | Entry: {entry_price} | SL: {sl_price} | TP: {tp_price}")
-
-        try:
-            self.kf.send_order({
-                "orderType": "stp", 
-                "symbol": symbol, 
-                "side": side, 
-                "size": abs_size, 
-                "stopPrice": sl_price,
-                "reduceOnly": True
+            # Desired Stop Loss
+            desired_orders.append({
+                "orderType": "stp", "side": exit_side, "size": abs_size, 
+                "price": sl_price, "reduceOnly": True
             })
-        except Exception as e:
-            bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
-
-        try:
-            self.kf.send_order({
-                "orderType": "take_profit", 
-                "symbol": symbol, 
-                "side": side, 
-                "size": abs_size, 
-                "stopPrice": tp_price, 
-                "reduceOnly": True
+            
+            # Desired Take Profit
+            desired_orders.append({
+                "orderType": "take_profit", "side": exit_side, "size": abs_size, 
+                "price": tp_price, "reduceOnly": True
             })
+
+        # 2. Fetch Existing Orders for this Symbol
+        try:
+            all_open = self.kf.get_open_orders().get("openOrders", [])
+            current_orders = [o for o in all_open if o["symbol"] == symbol_lower]
         except Exception as e:
-            bot_log(f"[{symbol.upper()}] TP Failed: {e}", level="error")
+            bot_log(f"[{symbol_upper}] Failed to fetch orders: {e}", level="error")
+            return
+
+        # 3. Match & Filter
+        # We need to find which existing orders match our desired orders.
+        # matched_desired_indices keeps track of desired orders that are already satisfied.
+        # orders_to_cancel are existing orders that match NOTHING in desired.
+        
+        matched_desired_indices = set()
+        orders_to_cancel = []
+
+        for order in current_orders:
+            is_necessary = False
+            for i, target in enumerate(desired_orders):
+                if i in matched_desired_indices:
+                    continue # Already found a match for this target
+                
+                # Check Match
+                if order["orderType"] != target["orderType"]: continue
+                if order["side"] != target["side"]: continue
+                
+                # Check Size (approx)
+                if abs(float(order["size"]) - target["size"]) > (specs["sizeStep"] / 2): continue
+                
+                # Check Price (approx) - key varies by order type in Kraken API
+                # For LMT -> limitPrice, For STP/TP -> stopPrice
+                existing_p = float(order.get("limitPrice", 0)) if target["orderType"] == "lmt" else float(order.get("stopPrice", 0))
+                if abs(existing_p - target["price"]) > (specs["tickSize"] / 2): continue
+                
+                # If we get here, it's a match
+                is_necessary = True
+                matched_desired_indices.add(i)
+                break
+            
+            if not is_necessary:
+                orders_to_cancel.append(order["order_id"])
+
+        # 4. Execute Cancellations
+        for oid in orders_to_cancel:
+            bot_log(f"[{symbol_upper}] Cancelling unnecessary order {oid}")
+            self.kf.cancel_order({"order_id": oid, "symbol": symbol_lower})
+
+        # 5. Place Missing Orders
+        for i, target in enumerate(desired_orders):
+            if i not in matched_desired_indices:
+                bot_log(f"[{symbol_upper}] Placing missing {target['orderType']} @ {target['price']}")
+                
+                # Construct Payload
+                payload = {
+                    "orderType": target["orderType"],
+                    "symbol": symbol_lower,
+                    "side": target["side"],
+                    "size": target["size"],
+                    "reduceOnly": target["reduceOnly"]
+                }
+                
+                if target["orderType"] == "lmt":
+                    payload["limitPrice"] = target["price"]
+                else:
+                    payload["stopPrice"] = target["price"]
+                
+                try:
+                    self.kf.send_order(payload)
+                except Exception as e:
+                    bot_log(f"[{symbol_upper}] Order Placement Failed: {e}", level="error")
 
 if __name__ == "__main__":
     bot = OctopusGridBot()
