@@ -275,7 +275,7 @@ class OctopusGridBot:
                     active_assets_count
                 )
 
-    def _execute_state_machine(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
+        def _execute_state_machine(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
         symbol_upper = symbol_str.upper()
         symbol_lower = symbol_str.lower()
         
@@ -292,45 +292,45 @@ class OctopusGridBot:
         
         if current_price == 0: return
 
-        # Fetch existing orders for this asset
+        # --- FIX: CASE INSENSITIVE FILTERING ---
         existing_orders = []
         try:
             all_open = self.kf.get_open_orders().get("openOrders", [])
-            existing_orders = [o for o in all_open if o["symbol"] == symbol_lower]
+            # Convert both to lower case for safe comparison
+            existing_orders = [o for o in all_open if o["symbol"].lower() == symbol_lower]
         except:
             return
 
         is_flat = abs(pos_size) < specs["sizeStep"]
         
-        bot_log(f"[{symbol_upper}] Price:{current_price} | Pos:{pos_size} | Orders:{len(existing_orders)}")
+        # Log the count so we can verify the fix
+        bot_log(f"[{symbol_upper}] Price:{current_price} | Pos:{pos_size} | OpenOrders:{len(existing_orders)}")
 
         # --- STATE MACHINE LOGIC ---
 
         if is_flat:
             # === STATE: FLAT ===
-            # Req 4 & 2: If we are flat, we need to be ready to enter.
-            # We must ensure NO "Stop" or "Profit" orders exist (leftovers from closed trades).
-            # We must ensure EXACTLY 2 Entry orders exist (Long Limit + Short Limit).
-
+            
             # 1. Clean up "Pollution" (Leftover SL/TP from previous trade)
             dirty_orders = [o for o in existing_orders if o["orderType"] in ["stp", "take_profit"]]
             if dirty_orders:
                 bot_log(f"[{symbol_upper}] FLAT: Cleaning up {len(dirty_orders)} stale exit orders.")
                 self.kf.cancel_all_orders({"symbol": symbol_lower})
-                existing_orders = [] # Reset local list as we wiped them
+                existing_orders = [] # Reset local list
 
             # 2. Check for Valid Entry Orders
-            # We expect exactly 1 Buy LMT and 1 Sell LMT
             buy_orders = [o for o in existing_orders if o["side"] == "buy" and o["orderType"] == "lmt"]
             sell_orders = [o for o in existing_orders if o["side"] == "sell" and o["orderType"] == "lmt"]
 
             # If we don't have exactly 1 of each, we reset and place new ones.
             if len(buy_orders) != 1 or len(sell_orders) != 1:
-                bot_log(f"[{symbol_upper}] FLAT: Setting up fresh Entry pair.")
+                bot_log(f"[{symbol_upper}] FLAT: Resetting Entry pair (Found {len(buy_orders)}B/{len(sell_orders)}S).")
                 
-                # Cancel partials if any
-                if existing_orders:
+                # FORCE CANCEL to be safe (even if existing_orders seemed empty, just in case)
+                try:
                     self.kf.cancel_all_orders({"symbol": symbol_lower})
+                except:
+                    pass
                 
                 # Calc Quantities
                 safe_equity = equity * 0.95
@@ -366,15 +366,13 @@ class OctopusGridBot:
                             "size": qty, "limitPrice": p
                         })
             else:
-                # We have our 2 orders. We are waiting.
+                # We have exactly 1 Buy and 1 Sell. Do nothing.
                 pass
 
         else:
             # === STATE: IN POSITION ===
-            # Req 3: "Cancel the other order and place a stop and a profit"
             
             # 1. Clean up "Pollution" (Entry Limit Orders that shouldn't be here)
-            # If we are in a position, any LMT order is the "other" order that didn't trigger.
             entry_leftovers = [o for o in existing_orders if o["orderType"] == "lmt"]
             if entry_leftovers:
                 bot_log(f"[{symbol_upper}] IN POS: Cancelling {len(entry_leftovers)} unused Entry orders.")
@@ -382,17 +380,14 @@ class OctopusGridBot:
                     self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
             
             # 2. Check for Bracket Orders
-            # We need 1 Stop Loss and 1 Take Profit
             sl_orders = [o for o in existing_orders if o["orderType"] == "stp"]
             tp_orders = [o for o in existing_orders if o["orderType"] == "take_profit"]
 
             if len(sl_orders) == 0 or len(tp_orders) == 0:
                 bot_log(f"[{symbol_upper}] IN POS: Placing missing Brackets.")
                 
-                # Ideally we check what's missing, but for robustness:
-                # If either is missing, we clear existing brackets and replace BOTH to ensure consistency.
+                # Clear any partials first to prevent duplicates
                 if sl_orders or tp_orders:
-                    # Cancel existing partial brackets
                     for o in sl_orders + tp_orders:
                         self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
 
