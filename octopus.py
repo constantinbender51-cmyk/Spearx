@@ -44,8 +44,6 @@ LEVERAGE = 1
 STRATEGY_URL = "https://live-trading-production.up.railway.app/api/parameters"
 
 # Asset Mapping: App Symbol -> Kraken Futures Symbol
-# Note: Kraken Futures usually follows PF_<Symbol>USD format.
-# BTC is XBT on Kraken.
 SYMBOL_MAP = {
     "BTC": "PF_XBTUSD",
     "ETH": "PF_ETHUSD",
@@ -85,29 +83,29 @@ class GridParamFetcher:
     def fetch_all_params(self) -> Dict[str, Dict[str, Any]]:
         """
         Fetches ALL parameters from the GA server.
-        Expected format from app.py when no symbol is specified: 
-        { 
-          "BTC": { "stop_percent": ..., "line_prices": ... },
-          "ETH": { "stop_percent": ..., "line_prices": ... },
-          ...
-        }
         """
         bot_log(f"Fetching grid params from {STRATEGY_URL}...")
         try:
             resp = requests.get(STRATEGY_URL, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
-                # Validate it's a dict
+                
+                # --- DEBUG: Print Raw Response to Console ---
+                print(f"\nDEBUG_RAW_RESPONSE: {data}\n")
+                # --------------------------------------------
+
                 if isinstance(data, dict):
                     valid_strategies = {}
                     for sym, params in data.items():
-                        # --- SAFETY CHECK ---
-                        # If params is not a dict (e.g., it's a float or string metadata), skip it.
-                        if not isinstance(params, dict):
+                        # We use try/except here so if one item is a float (causing TypeError),
+                        # we skip ONLY that item, not the whole loop.
+                        try:
+                            if "line_prices" in params and "stop_percent" in params:
+                                valid_strategies[sym] = params
+                        except TypeError:
+                            bot_log(f"Skipping invalid entry '{sym}': Data was not a dict (Got {type(params)})", level="warning")
                             continue
-                        
-                        if "line_prices" in params and "stop_percent" in params:
-                            valid_strategies[sym] = params
+                            
                     return valid_strategies
                 else:
                     bot_log("Invalid JSON structure from server (expected Dict).", level="warning")
@@ -147,7 +145,6 @@ class OctopusGridBot:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
             resp = requests.get(url).json()
             if "instruments" in resp:
-                # We want to cache specs for ALL potential mapped symbols
                 target_kraken_symbols = set(SYMBOL_MAP.values())
                 
                 for inst in resp["instruments"]:
@@ -202,14 +199,14 @@ class OctopusGridBot:
             if now.second >= 5 and now.second < 10:
                 bot_log(f">>> TRIGGER: {now.strftime('%H:%M:%S')} <<<")
                 self._process_cycle()
-                time.sleep(50) # Sleep to pass the trigger window
+                time.sleep(50) 
             time.sleep(1)
 
     def _process_cycle(self):
         # 1. Fetch ALL Strategy Parameters
         all_params = self.fetcher.fetch_all_params()
         if not all_params:
-            bot_log("No params received from server. Skipping cycle.", level="warning")
+            bot_log("No params received. Skipping cycle.", level="warning")
             return
         
         # 2. Account Health Check
@@ -229,14 +226,10 @@ class OctopusGridBot:
             return
 
         # 3. Determine Execution Size per Asset
-        # To avoid overleveraging, we split equity among active strategies.
-        # We use a conservative 90% of equity divided by the number of active assets.
         active_assets_count = len(all_params)
         if active_assets_count == 0: return
         
         # 4. Execute Logic for Each Asset
-        # Using ThreadPool to prevent IO blocking (HTTP requests) from delaying other assets 
-        # within the 5-second trigger window.
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             for app_symbol, params in all_params.items():
                 kraken_symbol = SYMBOL_MAP.get(app_symbol)
@@ -257,7 +250,6 @@ class OctopusGridBot:
         symbol_upper = symbol_str.upper()
         symbol_lower = symbol_str.lower()
         
-        # Extract Params
         grid_lines = np.sort(np.array(params["line_prices"]))
         stop_pct = params["stop_percent"]
         profit_pct = params["profit_percent"]
@@ -267,34 +259,22 @@ class OctopusGridBot:
             bot_log(f"No specs for {symbol_upper} - skipping.", level="error")
             return
 
-        # Get State
         pos_size, entry_price = self._get_position_details(symbol_upper)
         current_price = self._get_mark_price(symbol_upper)
         
         if current_price == 0: return
 
-        # Calculate Position Status
         is_flat = abs(pos_size) < specs["sizeStep"]
         
         bot_log(f"[{symbol_upper}] Price: {current_price} | Pos: {pos_size} @ {entry_price}")
 
-        # --- LOGIC BRANCH ---
-        
         if is_flat:
-            # --- 1. FLAT: Place Grid Entry Orders ---
-            
-            # Find nearest lines
+            # --- FLAT: Place Grid Entry Orders ---
             idx = np.searchsorted(grid_lines, current_price)
-            
-            # Line Below (Buy Trigger)
             line_below = grid_lines[idx-1] if idx > 0 else None
-            
-            # Line Above (Sell Trigger)
             line_above = grid_lines[idx] if idx < len(grid_lines) else None
             
-            # Calculate Order Size (Split Equity Logic)
-            # Allocation = (Equity * 0.95) / Count
-            # Unit per trade = Allocation * LEVERAGE * 0.20 (Conservative entry within allocation)
+            # Split Equity Logic
             safe_equity = equity * 0.95
             allocation_per_asset = safe_equity / max(1, asset_count)
             unit_usd = (allocation_per_asset * LEVERAGE) * 0.20 
@@ -306,11 +286,9 @@ class OctopusGridBot:
                 bot_log(f"[{symbol_upper}] Qty too small ({qty}).", level="warning")
                 return
 
-            # Cancel Existing Orders (Fresh Start for Grid)
             try: self.kf.cancel_all_orders({"symbol": symbol_lower})
             except: pass
             
-            # Place LONG Entry (Limit Buy at line_below)
             if line_below:
                 price = self._round_to_step(line_below, specs["tickSize"])
                 if price < current_price:
@@ -320,7 +298,6 @@ class OctopusGridBot:
                         "size": qty, "limitPrice": price
                     })
             
-            # Place SHORT Entry (Limit Sell at line_above)
             if line_above:
                 price = self._round_to_step(line_above, specs["tickSize"])
                 if price > current_price:
@@ -331,9 +308,7 @@ class OctopusGridBot:
                     })
 
         else:
-            # --- 2. IN POSITION: Manage Exits (SL/TP) ---
-            
-            # First, Cancel any lingering Entry Limits
+            # --- IN POSITION: Manage Exits ---
             try:
                 open_orders = self.kf.get_open_orders().get("openOrders", [])
                 for o in open_orders:
@@ -342,7 +317,6 @@ class OctopusGridBot:
             except Exception as e:
                 bot_log(f"[{symbol_upper}] Cleanup error: {e}", level="warning")
 
-            # Check for existing protective orders
             has_sl = False
             has_tp = False
             
@@ -354,20 +328,15 @@ class OctopusGridBot:
                         if o["orderType"] == "take_profit": has_tp = True
             except: pass
 
-            # If missing protection, place it
             if not has_sl or not has_tp:
                 self._place_bracket_orders(symbol_lower, pos_size, entry_price, stop_pct, profit_pct, specs["tickSize"])
 
     def _place_bracket_orders(self, symbol: str, position_size: float, entry_price: float, 
                               sl_pct: float, tp_pct: float, tick_size: float):
-        """
-        Places OCO-like Stop Loss and Take Profit orders.
-        """
         is_long = position_size > 0
         side = "sell" if is_long else "buy"
         abs_size = abs(position_size)
 
-        # Calculate Prices
         if is_long:
             sl_price = entry_price * (1 - sl_pct)
             tp_price = entry_price * (1 + tp_pct)
@@ -380,7 +349,6 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] Adding Brackets | Entry: {entry_price} | SL: {sl_price} | TP: {tp_price}")
 
-        # Send Stop Loss
         try:
             self.kf.send_order({
                 "orderType": "stp", 
@@ -393,7 +361,6 @@ class OctopusGridBot:
         except Exception as e:
             bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
 
-        # Send Take Profit
         try:
             self.kf.send_order({
                 "orderType": "take_profit", 
