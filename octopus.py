@@ -275,7 +275,7 @@ class OctopusGridBot:
                     active_assets_count
                 )
 
-        def _execute_state_machine(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
+    def _execute_state_machine(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
         symbol_upper = symbol_str.upper()
         symbol_lower = symbol_str.lower()
         
