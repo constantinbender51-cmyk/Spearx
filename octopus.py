@@ -41,7 +41,7 @@ MAX_WORKERS = 5
 LEVERAGE = 1
 
 # Strategy Endpoint (The app.py server)
-STRATEGY_URL = "https://live-trading-production.up.railway.app/api/parameters"
+STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
 
 # Asset Mapping: App Symbol -> Kraken Futures Symbol
 SYMBOL_MAP = {
