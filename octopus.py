@@ -344,11 +344,10 @@ class OctopusGridBot:
                 open_orders = self.kf.get_open_orders().get("openOrders", [])
                 for o in open_orders:
                     if o["symbol"].lower() == symbol_lower:
-                        # Check for STP or STPLMT
-                        if o["orderType"] in ["stp", "stplmt"]: has_sl = True
+                        # Check for STP
+                        if o["orderType"] == "stp": has_sl = True
                         # Check for TP (using LMT + reduceOnly)
                         if o["orderType"] == "lmt" and o.get("reduceOnly", False): has_tp = True
-                        if o["orderType"] == "take_profit": has_tp = True
             except: pass
 
             if not has_sl or not has_tp:
@@ -368,40 +367,4 @@ class OctopusGridBot:
             tp_price = entry_price * (1 - tp_pct)
 
         sl_price = self._round_to_step(sl_price, tick_size)
-        tp_price = self._round_to_step(tp_price, tick_size)
-
-        bot_log(f"[{symbol.upper()}] Adding Brackets | Entry: {entry_price} | SL: {sl_price} | TP: {tp_price}")
-
-        # STOP LOSS: 'stp' type but WITH limitPrice as requested
-        try:
-            sl_resp = self.kf.send_order({
-                "orderType": "stp", 
-                "symbol": symbol, 
-                "side": side, 
-                "size": abs_size, 
-                "stopPrice": sl_price, 
-                "limitPrice": sl_price, # Added limitPrice to prevent rejection
-                "reduceOnly": True
-            })
-            print(f"DEBUG_SL_RESPONSE [{symbol.upper()}]: {sl_resp}")
-        except Exception as e:
-            bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
-
-        # TAKE PROFIT: 'lmt' type with limitPrice
-        try:
-            tp_resp = self.kf.send_order({
-                "orderType": "lmt", 
-                "symbol": symbol, 
-                "side": side, 
-                "size": abs_size, 
-                "limitPrice": tp_price, 
-                "reduceOnly": True
-            })
-            print(f"DEBUG_TP_RESPONSE [{symbol.upper()}]: {tp_resp}")
-        except Exception as e:
-            bot_log(f"[{symbol.upper()}] TP Failed: {e}", level="error")
-
-if __name__ == "__main__":
-    bot = OctopusGridBot()
-    bot.initialize()
-    bot.run()
+        tp_price = self._round_to_
