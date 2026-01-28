@@ -38,10 +38,9 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-# CRITICAL: Reduced from 16 to 2 to prevent rate limits during 30-order bursts
 MAX_WORKERS = 2 
 LEVERAGE = 10
-TEST_ASSET_LIMIT = 15  # Set to handle all assets
+TEST_ASSET_LIMIT = 15
 
 # Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
@@ -92,11 +91,6 @@ class GridParamFetcher:
             resp = requests.get(STRATEGY_URL, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
-                
-                # --- DEBUG: Print suppressed per user request ---
-                # print(f"\nDEBUG_RAW_RESPONSE: {data}\n") 
-                # --------------------------------------------
-
                 if isinstance(data, dict):
                     valid_strategies = {}
                     for sym, params in data.items():
@@ -104,17 +98,15 @@ class GridParamFetcher:
                             if "line_prices" in params and "stop_percent" in params:
                                 valid_strategies[sym] = params
                         except TypeError:
-                            bot_log(f"Skipping invalid entry '{sym}': Data was not a dict (Got {type(params)})", level="warning")
+                            bot_log(f"Skipping invalid entry '{sym}': Data was not a dict", level="warning")
                             continue
-                            
                     return valid_strategies
                 else:
-                    bot_log("Invalid JSON structure from server (expected Dict).", level="warning")
+                    bot_log("Invalid JSON structure from server.", level="warning")
             else:
                 bot_log(f"HTTP Error {resp.status_code}", level="warning")
         except Exception as e:
             bot_log(f"Param Fetch Failed: {e}", level="error")
-        
         return {}
 
 # --- Main Engine ---
@@ -146,11 +138,10 @@ class OctopusGridBot:
                 try:
                     self.kf.cancel_all_orders({"symbol": sym.lower()})
                     bot_log(f"[{i+1}/{len(unique_symbols)}] Cancelled orders for {sym}")
-                    # Throttle heavily on startup to avoid hitting limits before we even begin
                     time.sleep(1.2) 
                 except Exception as e:
                     bot_log(f"Failed to cancel {sym}: {e}", level="warning")
-                    time.sleep(2.0) # Wait longer on error
+                    time.sleep(2.0) 
                     
         except Exception as e:
             bot_log(f"Startup Failed: {e}", level="error")
@@ -162,7 +153,6 @@ class OctopusGridBot:
             resp = requests.get(url).json()
             if "instruments" in resp:
                 target_kraken_symbols = set(SYMBOL_MAP.values())
-                
                 for inst in resp["instruments"]:
                     sym = inst["symbol"].upper()
                     if sym in target_kraken_symbols:
@@ -181,7 +171,6 @@ class OctopusGridBot:
         return float(f"{rounded:.10g}")
 
     def _get_position_details(self, kf_symbol_upper: str) -> Tuple[float, float]:
-        """Returns (size, avgEntryPrice)"""
         try:
             open_pos = self.kf.get_open_positions()
             if "openPositions" in open_pos:
@@ -211,7 +200,6 @@ class OctopusGridBot:
         bot_log("Bot started. Syncing to 1m intervals...")
         while True:
             now = datetime.now(timezone.utc)
-            # Trigger every minute at :05 seconds
             if now.second >= 5 and now.second < 10:
                 bot_log(f">>> TRIGGER: {now.strftime('%H:%M:%S')} <<<")
                 self._process_cycle()
@@ -219,13 +207,11 @@ class OctopusGridBot:
             time.sleep(1)
 
     def _process_cycle(self):
-        # 1. Fetch ALL Strategy Parameters
         all_params = self.fetcher.fetch_all_params()
         if not all_params:
             bot_log("No params received. Skipping cycle.", level="warning")
             return
         
-        # 2. Account Health Check
         try:
             acc = self.kf.get_accounts()
             if "flex" in acc.get("accounts", {}):
@@ -241,24 +227,18 @@ class OctopusGridBot:
             bot_log(f"Account fetch failed: {e}", level="error")
             return
 
-        # 3. Determine Execution Size per Asset (TESTING LIMIT APPLIED HERE)
         limited_keys = list(all_params.keys())[:TEST_ASSET_LIMIT]
         limited_params = {k: all_params[k] for k in limited_keys}
         
         active_assets_count = len(limited_params)
-        
         bot_log(f"Cycle: Processing {active_assets_count} assets with {MAX_WORKERS} workers.")
         
         if active_assets_count == 0: return
         
-        # 4. Execute Logic for Each Asset
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             for app_symbol, params in limited_params.items():
                 kraken_symbol = SYMBOL_MAP.get(app_symbol)
-                
-                if not kraken_symbol:
-                    bot_log(f"Skipping {app_symbol}: No Kraken mapping found.", level="warning")
-                    continue
+                if not kraken_symbol: continue
                 
                 executor.submit(
                     self._execute_grid_logic, 
@@ -269,7 +249,6 @@ class OctopusGridBot:
                 )
 
     def _execute_grid_logic(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
-        # Jitter: Add a random small delay (0.1 to 1.5s) to prevent workers from hitting API exact same millisecond
         time.sleep(random.uniform(0.1, 1.5))
         
         symbol_upper = symbol_str.upper()
@@ -280,9 +259,7 @@ class OctopusGridBot:
         profit_pct = params["profit_percent"]
 
         specs = self.instrument_specs.get(symbol_upper)
-        if not specs: 
-            bot_log(f"No specs for {symbol_upper} - skipping.", level="error")
-            return
+        if not specs: return
 
         pos_size, entry_price = self._get_position_details(symbol_upper)
         current_price = self._get_mark_price(symbol_upper)
@@ -294,12 +271,10 @@ class OctopusGridBot:
         bot_log(f"[{symbol_upper}] Price: {current_price} | Pos: {pos_size} @ {entry_price}")
 
         if is_flat:
-            # --- FLAT: Place Grid Entry Orders ---
             idx = np.searchsorted(grid_lines, current_price)
             line_below = grid_lines[idx-1] if idx > 0 else None
             line_above = grid_lines[idx] if idx < len(grid_lines) else None
             
-            # Split Equity Logic
             safe_equity = equity * 0.95
             allocation_per_asset = safe_equity / max(1, asset_count)
             unit_usd = (allocation_per_asset * LEVERAGE) * 0.20 
@@ -314,22 +289,19 @@ class OctopusGridBot:
             try: self.kf.cancel_all_orders({"symbol": symbol_lower})
             except: pass
             
-            # Additional small sleep between buy and sell orders for same asset
             if line_below:
                 price = self._round_to_step(line_below, specs["tickSize"])
                 if price < current_price:
-                    bot_log(f"[{symbol_upper}] Placing BUY LMT @ {price} (Qty: {qty})")
                     self.kf.send_order({
                         "orderType": "lmt", "symbol": symbol_lower, "side": "buy",
                         "size": qty, "limitPrice": price
                     })
             
-            time.sleep(0.2) # Micro-sleep between orders
+            time.sleep(0.2) 
 
             if line_above:
                 price = self._round_to_step(line_above, specs["tickSize"])
                 if price > current_price:
-                    bot_log(f"[{symbol_upper}] Placing SELL LMT @ {price} (Qty: {qty})")
                     self.kf.send_order({
                         "orderType": "lmt", "symbol": symbol_lower, "side": "sell",
                         "size": qty, "limitPrice": price
@@ -337,28 +309,45 @@ class OctopusGridBot:
 
         else:
             # --- IN POSITION: Manage Exits ---
-            try:
-                open_orders = self.kf.get_open_orders().get("openOrders", [])
-                for o in open_orders:
-                    if o["symbol"].lower() == symbol_lower and o["orderType"] == "lmt":
-                        # We cancel basic limits, but keep Take Profits (if they are type 'lmt' with reduceOnly)
-                        if not o.get("reduceOnly", False):
-                            self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
-            except Exception as e:
-                bot_log(f"[{symbol_upper}] Cleanup error: {e}", level="warning")
-
             has_sl = False
             has_tp = False
             
             try:
                 open_orders = self.kf.get_open_orders().get("openOrders", [])
+                
+                # --- DEBUG: Print one order to see structure ---
+                # if open_orders: bot_log(f"DEBUG {symbol_upper} Order[0]: {open_orders[0]}")
+                # -----------------------------------------------
+
                 for o in open_orders:
-                    if o["symbol"].lower() == symbol_lower:
-                        # Check for STP
-                        if o["orderType"] == "stp": has_sl = True
-                        # Check for TP (using LMT + reduceOnly)
-                        if o["orderType"] == "lmt" and o.get("reduceOnly", False): has_tp = True
-            except: pass
+                    # Robust Symbol Check
+                    o_sym = o.get("symbol", "").lower()
+                    if o_sym != symbol_lower:
+                        continue
+                        
+                    # Extract Type safely (check 'orderType' OR 'type')
+                    o_type = o.get("orderType", o.get("type", "")).lower()
+                    o_reduce = o.get("reduceOnly", False)
+                    
+                    # 1. Cleanup old grid limits (LMT without reduceOnly)
+                    if o_type == "lmt" and not o_reduce:
+                        try:
+                            self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
+                        except: pass
+                        continue
+
+                    # 2. Check for SL (stp)
+                    # We check for 'stp' OR if it has a stopPrice
+                    if o_type == "stp" or "stopPrice" in o:
+                        has_sl = True
+                        
+                    # 3. Check for TP (lmt + reduceOnly)
+                    # Note: API might return type "take_profit" if sent as such, but we sent as lmt
+                    if (o_type == "lmt" and o_reduce) or o_type == "take_profit":
+                        has_tp = True
+
+            except Exception as e:
+                bot_log(f"[{symbol_upper}] Order Check Error: {e}", level="error")
 
             if not has_sl or not has_tp:
                 self._place_bracket_orders(symbol_lower, pos_size, entry_price, stop_pct, profit_pct, specs["tickSize"])
@@ -381,7 +370,7 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] Adding Brackets | Entry: {entry_price} | SL: {sl_price} | TP: {tp_price}")
 
-        # STOP LOSS: 'stp' type with limitPrice + triggerSignal="mark"
+        # STOP LOSS
         try:
             sl_resp = self.kf.send_order({
                 "orderType": "stp", 
@@ -393,21 +382,14 @@ class OctopusGridBot:
                 "triggerSignal": "mark", 
                 "reduceOnly": True
             })
-            
-            # --- Status Inspection ---
-            status = "unknown"
-            if "sendStatus" in sl_resp and "orderEvents" in sl_resp["sendStatus"]:
-                events = sl_resp["sendStatus"]["orderEvents"]
-                if events:
-                    status = events[0].get("order", {}).get("status", "unknown")
-            
-            bot_log(f"SL Response [{symbol.upper()}]: Status={status} | {sl_resp}")
+            # Log result briefly
+            if "error" in sl_resp and sl_resp["error"]:
+                 bot_log(f"[{symbol.upper()}] SL API Error: {sl_resp['error']}", level="error")
             time.sleep(0.3)
-
         except Exception as e:
             bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
 
-        # TAKE PROFIT: 'lmt' type with limitPrice
+        # TAKE PROFIT
         try:
             tp_resp = self.kf.send_order({
                 "orderType": "lmt", 
@@ -417,15 +399,8 @@ class OctopusGridBot:
                 "limitPrice": tp_price, 
                 "reduceOnly": True
             })
-            
-            status = "unknown"
-            if "sendStatus" in tp_resp and "orderEvents" in tp_resp["sendStatus"]:
-                events = tp_resp["sendStatus"]["orderEvents"]
-                if events:
-                    status = events[0].get("order", {}).get("status", "unknown")
-            
-            bot_log(f"TP Response [{symbol.upper()}]: Status={status} | {tp_resp}")
-
+            if "error" in tp_resp and tp_resp["error"]:
+                 bot_log(f"[{symbol.upper()}] TP API Error: {tp_resp['error']}", level="error")
         except Exception as e:
             bot_log(f"[{symbol.upper()}] TP Failed: {e}", level="error")
 
