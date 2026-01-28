@@ -91,8 +91,8 @@ class GridParamFetcher:
             if resp.status_code == 200:
                 data = resp.json()
                 
-                # --- DEBUG: Print Raw Response to Console ---
-                print(f"\nDEBUG_RAW_RESPONSE: {data}\n")
+                # --- DEBUG: Print suppressed per user request ---
+                # print(f"\nDEBUG_RAW_RESPONSE: {data}\n") 
                 # --------------------------------------------
 
                 if isinstance(data, dict):
@@ -370,7 +370,7 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] Adding Brackets | Entry: {entry_price} | SL: {sl_price} | TP: {tp_price}")
 
-        # STOP LOSS: 'stp' type with mandatory limitPrice
+        # STOP LOSS: 'stp' type with limitPrice + triggerSignal="mark"
         try:
             sl_resp = self.kf.send_order({
                 "orderType": "stp", 
@@ -378,10 +378,20 @@ class OctopusGridBot:
                 "side": side, 
                 "size": abs_size, 
                 "stopPrice": sl_price, 
-                "limitPrice": sl_price, # Required per instructions: defines worst fill price
+                "limitPrice": sl_price, 
+                "triggerSignal": "mark",  # Explicitly use Mark price to avoid wicks
                 "reduceOnly": True
             })
-            print(f"DEBUG_SL_RESPONSE [{symbol.upper()}]: {sl_resp}")
+            
+            # --- Status Inspection ---
+            status = "unknown"
+            if "sendStatus" in sl_resp and "orderEvents" in sl_resp["sendStatus"]:
+                events = sl_resp["sendStatus"]["orderEvents"]
+                if events:
+                    status = events[0].get("order", {}).get("status", "unknown")
+            
+            bot_log(f"SL Response [{symbol.upper()}]: Status={status} | {sl_resp}")
+
         except Exception as e:
             bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
 
@@ -395,7 +405,15 @@ class OctopusGridBot:
                 "limitPrice": tp_price, 
                 "reduceOnly": True
             })
-            print(f"DEBUG_TP_RESPONSE [{symbol.upper()}]: {tp_resp}")
+            
+            status = "unknown"
+            if "sendStatus" in tp_resp and "orderEvents" in tp_resp["sendStatus"]:
+                events = tp_resp["sendStatus"]["orderEvents"]
+                if events:
+                    status = events[0].get("order", {}).get("status", "unknown")
+            
+            bot_log(f"TP Response [{symbol.upper()}]: Status={status} | {tp_resp}")
+
         except Exception as e:
             bot_log(f"[{symbol.upper()}] TP Failed: {e}", level="error")
 
