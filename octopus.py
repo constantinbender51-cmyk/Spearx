@@ -97,10 +97,15 @@ class GridParamFetcher:
             resp = requests.get(STRATEGY_URL, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
-                # Validate it's a dict of dicts
+                # Validate it's a dict
                 if isinstance(data, dict):
                     valid_strategies = {}
                     for sym, params in data.items():
+                        # --- SAFETY CHECK ---
+                        # If params is not a dict (e.g., it's a float or string metadata), skip it.
+                        if not isinstance(params, dict):
+                            continue
+                        
                         if "line_prices" in params and "stop_percent" in params:
                             valid_strategies[sym] = params
                     return valid_strategies
