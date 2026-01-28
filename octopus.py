@@ -13,6 +13,7 @@ import time
 import logging
 import requests
 import threading
+import random
 import numpy as np
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -37,9 +38,10 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-MAX_WORKERS = 4
+# CRITICAL: Reduced from 16 to 2 to prevent rate limits during 30-order bursts
+MAX_WORKERS = 2 
 LEVERAGE = 10
-TEST_ASSET_LIMIT = 15 # Limit execution to 4 assets for testing
+TEST_ASSET_LIMIT = 15  # Set to handle all assets
 
 # Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
@@ -136,17 +138,19 @@ class OctopusGridBot:
             else:
                 bot_log("API Connection Successful.")
 
-            # --- 1. Cancel All Orders on Startup ---
+            # --- 1. Cancel All Orders on Startup (Throttled) ---
             bot_log("Startup: Canceling all open orders for mapped assets...")
             unique_symbols = set(SYMBOL_MAP.values())
-            for sym in unique_symbols:
+            
+            for i, sym in enumerate(unique_symbols):
                 try:
-                    # API usually expects lowercase symbols for order management
                     self.kf.cancel_all_orders({"symbol": sym.lower()})
-                    bot_log(f"Cancelled orders for {sym}")
-                    time.sleep(0.5) # Added sleep to prevent apiLimitExceeded
+                    bot_log(f"[{i+1}/{len(unique_symbols)}] Cancelled orders for {sym}")
+                    # Throttle heavily on startup to avoid hitting limits before we even begin
+                    time.sleep(1.2) 
                 except Exception as e:
                     bot_log(f"Failed to cancel {sym}: {e}", level="warning")
+                    time.sleep(2.0) # Wait longer on error
                     
         except Exception as e:
             bot_log(f"Startup Failed: {e}", level="error")
@@ -243,7 +247,7 @@ class OctopusGridBot:
         
         active_assets_count = len(limited_params)
         
-        bot_log(f"TEST MODE: Limiting active assets to {active_assets_count}: {limited_keys}")
+        bot_log(f"Cycle: Processing {active_assets_count} assets with {MAX_WORKERS} workers.")
         
         if active_assets_count == 0: return
         
@@ -265,6 +269,9 @@ class OctopusGridBot:
                 )
 
     def _execute_grid_logic(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
+        # Jitter: Add a random small delay (0.1 to 1.5s) to prevent workers from hitting API exact same millisecond
+        time.sleep(random.uniform(0.1, 1.5))
+        
         symbol_upper = symbol_str.upper()
         symbol_lower = symbol_str.lower()
         
@@ -307,6 +314,7 @@ class OctopusGridBot:
             try: self.kf.cancel_all_orders({"symbol": symbol_lower})
             except: pass
             
+            # Additional small sleep between buy and sell orders for same asset
             if line_below:
                 price = self._round_to_step(line_below, specs["tickSize"])
                 if price < current_price:
@@ -316,6 +324,8 @@ class OctopusGridBot:
                         "size": qty, "limitPrice": price
                     })
             
+            time.sleep(0.2) # Micro-sleep between orders
+
             if line_above:
                 price = self._round_to_step(line_above, specs["tickSize"])
                 if price > current_price:
@@ -380,7 +390,7 @@ class OctopusGridBot:
                 "size": abs_size, 
                 "stopPrice": sl_price, 
                 "limitPrice": sl_price, 
-                "triggerSignal": "mark",  # Explicitly use Mark price to avoid wicks
+                "triggerSignal": "mark", 
                 "reduceOnly": True
             })
             
@@ -392,6 +402,7 @@ class OctopusGridBot:
                     status = events[0].get("order", {}).get("status", "unknown")
             
             bot_log(f"SL Response [{symbol.upper()}]: Status={status} | {sl_resp}")
+            time.sleep(0.3)
 
         except Exception as e:
             bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
