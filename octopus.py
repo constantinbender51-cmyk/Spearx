@@ -37,7 +37,7 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-MAX_WORKERS = 16
+MAX_WORKERS = 4
 LEVERAGE = 10
 TEST_ASSET_LIMIT = 15 # Limit execution to 4 assets for testing
 
