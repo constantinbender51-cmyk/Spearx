@@ -4,7 +4,7 @@ Octopus Grid: Execution Engine for GA Grid Strategy
 - Source: Connects to app.py endpoint (/api/parameters)
 - Logic: Grid Entry (Nearest Lines) + Dynamic SL/TP
 - Schedule: Every 1 minute
-- Assets: Specialized for BTC (due to absolute price grid lines)
+- Assets: Multi-Asset Support (Maps app.py symbols to Kraken Futures)
 """
 
 import os
@@ -43,11 +43,26 @@ LEVERAGE = 1
 # Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://live-trading-production.up.railway.app/api/parameters"
 
-# Asset Mapping
-# Note: Grid lines are absolute prices (e.g. 95000). 
-# This logic is restricted to BTC to avoid using BTC price levels on other assets.
-TARGET_ASSET_BINANCE = "BTCUSDT"
-TARGET_ASSET_KRAKEN = "pf_xbtusd"
+# Asset Mapping: App Symbol -> Kraken Futures Symbol
+# Note: Kraken Futures usually follows PF_<Symbol>USD format.
+# BTC is XBT on Kraken.
+SYMBOL_MAP = {
+    "BTC": "PF_XBTUSD",
+    "ETH": "PF_ETHUSD",
+    "XRP": "PF_XRPUSD",
+    "SOL": "PF_SOLUSD",
+    "DOGE": "PF_DOGEUSD",
+    "ADA": "PF_ADAUSD",
+    "BCH": "PF_BCHUSD",
+    "LINK": "PF_LINKUSD",
+    "XLM": "PF_XLMUSD",
+    "SUI": "PF_SUIUSD",
+    "AVAX": "PF_AVAXUSD",
+    "LTC": "PF_LTCUSD",
+    "HBAR": "PF_HBARUSD",
+    "SHIB": "PF_SHIBUSD",
+    "TON": "PF_TONUSD",
+}
 
 # Logging Setup
 logging.basicConfig(
@@ -67,14 +82,14 @@ def bot_log(msg, level="info"):
 # --- Strategy Fetcher ---
 
 class GridParamFetcher:
-    def fetch_params(self) -> Dict[str, Any]:
+    def fetch_all_params(self) -> Dict[str, Dict[str, Any]]:
         """
-        Fetches best individual parameters from the GA server.
-        Expected format: 
+        Fetches ALL parameters from the GA server.
+        Expected format from app.py when no symbol is specified: 
         { 
-          "stop_percent": 0.01,
-          "profit_percent": 0.02,
-          "line_prices": [95000, 95500, ...]
+          "BTC": { "stop_percent": ..., "line_prices": ... },
+          "ETH": { "stop_percent": ..., "line_prices": ... },
+          ...
         }
         """
         bot_log(f"Fetching grid params from {STRATEGY_URL}...")
@@ -82,10 +97,15 @@ class GridParamFetcher:
             resp = requests.get(STRATEGY_URL, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
-                if "line_prices" in data and "stop_percent" in data:
-                    return data
+                # Validate it's a dict of dicts
+                if isinstance(data, dict):
+                    valid_strategies = {}
+                    for sym, params in data.items():
+                        if "line_prices" in params and "stop_percent" in params:
+                            valid_strategies[sym] = params
+                    return valid_strategies
                 else:
-                    bot_log("Invalid JSON structure from server.", level="warning")
+                    bot_log("Invalid JSON structure from server (expected Dict).", level="warning")
             else:
                 bot_log(f"HTTP Error {resp.status_code}", level="warning")
         except Exception as e:
@@ -102,7 +122,7 @@ class OctopusGridBot:
         self.instrument_specs = {}
 
     def initialize(self):
-        bot_log("--- Initializing Octopus Grid Bot (1m Cycle) ---")
+        bot_log("--- Initializing Octopus Grid Bot (Multi-Asset 1m Cycle) ---")
         
         self._fetch_instrument_specs()
         
@@ -122,10 +142,12 @@ class OctopusGridBot:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
             resp = requests.get(url).json()
             if "instruments" in resp:
+                # We want to cache specs for ALL potential mapped symbols
+                target_kraken_symbols = set(SYMBOL_MAP.values())
+                
                 for inst in resp["instruments"]:
                     sym = inst["symbol"].upper()
-                    # We only care about the target asset for this strategy
-                    if sym == TARGET_ASSET_KRAKEN.upper():
+                    if sym in target_kraken_symbols:
                         precision = inst.get("contractValueTradePrecision", 3)
                         self.instrument_specs[sym] = {
                             "sizeStep": 10 ** (-int(precision)) if precision is not None else 1.0,
@@ -153,7 +175,7 @@ class OctopusGridBot:
                         return size, entry
             return 0.0, 0.0
         except Exception as e:
-            bot_log(f"Position Fetch Error: {e}", level="error")
+            bot_log(f"[{kf_symbol_upper}] Position Fetch Error: {e}", level="error")
             return 0.0, 0.0
 
     def _get_mark_price(self, kf_symbol_upper: str) -> float:
@@ -164,7 +186,7 @@ class OctopusGridBot:
                     return float(t["markPrice"])
             return 0.0
         except Exception as e:
-            bot_log(f"Ticker Fetch Error: {e}", level="error")
+            bot_log(f"[{kf_symbol_upper}] Ticker Fetch Error: {e}", level="error")
             return 0.0
 
     def run(self):
@@ -179,15 +201,11 @@ class OctopusGridBot:
             time.sleep(1)
 
     def _process_cycle(self):
-        # 1. Fetch Strategy Parameters
-        params = self.fetcher.fetch_params()
-        if not params:
-            bot_log("No params received. Skipping cycle.", level="warning")
+        # 1. Fetch ALL Strategy Parameters
+        all_params = self.fetcher.fetch_all_params()
+        if not all_params:
+            bot_log("No params received from server. Skipping cycle.", level="warning")
             return
-
-        grid_lines = np.sort(np.array(params["line_prices"]))
-        stop_pct = params["stop_percent"]
-        profit_pct = params["profit_percent"]
         
         # 2. Account Health Check
         try:
@@ -205,16 +223,43 @@ class OctopusGridBot:
             bot_log(f"Account fetch failed: {e}", level="error")
             return
 
-        # 3. Execute Logic for Target Asset
-        self._execute_grid_logic(TARGET_ASSET_KRAKEN, equity, grid_lines, stop_pct, profit_pct)
+        # 3. Determine Execution Size per Asset
+        # To avoid overleveraging, we split equity among active strategies.
+        # We use a conservative 90% of equity divided by the number of active assets.
+        active_assets_count = len(all_params)
+        if active_assets_count == 0: return
+        
+        # 4. Execute Logic for Each Asset
+        # Using ThreadPool to prevent IO blocking (HTTP requests) from delaying other assets 
+        # within the 5-second trigger window.
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for app_symbol, params in all_params.items():
+                kraken_symbol = SYMBOL_MAP.get(app_symbol)
+                
+                if not kraken_symbol:
+                    bot_log(f"Skipping {app_symbol}: No Kraken mapping found.", level="warning")
+                    continue
+                
+                executor.submit(
+                    self._execute_grid_logic, 
+                    kraken_symbol, 
+                    equity, 
+                    params, 
+                    active_assets_count
+                )
 
-    def _execute_grid_logic(self, symbol_str: str, equity: float, lines: np.ndarray, stop_pct: float, profit_pct: float):
+    def _execute_grid_logic(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
         symbol_upper = symbol_str.upper()
         symbol_lower = symbol_str.lower()
         
+        # Extract Params
+        grid_lines = np.sort(np.array(params["line_prices"]))
+        stop_pct = params["stop_percent"]
+        profit_pct = params["profit_percent"]
+
         specs = self.instrument_specs.get(symbol_upper)
         if not specs: 
-            bot_log(f"No specs for {symbol_upper}", level="error")
+            bot_log(f"No specs for {symbol_upper} - skipping.", level="error")
             return
 
         # Get State
@@ -234,24 +279,26 @@ class OctopusGridBot:
             # --- 1. FLAT: Place Grid Entry Orders ---
             
             # Find nearest lines
-            idx = np.searchsorted(lines, current_price)
+            idx = np.searchsorted(grid_lines, current_price)
             
             # Line Below (Buy Trigger)
-            line_below = lines[idx-1] if idx > 0 else None
+            line_below = grid_lines[idx-1] if idx > 0 else None
             
             # Line Above (Sell Trigger)
-            line_above = lines[idx] if idx < len(lines) else None
+            line_above = grid_lines[idx] if idx < len(grid_lines) else None
             
-            # Calculate Order Size (Standard Unit based on Equity)
-            # Conservative sizing: 95% of equity * leverage / price
-            # Or just fixed unit? Using strict 20% of Buying Power for safety in grid
+            # Calculate Order Size (Split Equity Logic)
+            # Allocation = (Equity * 0.95) / Count
+            # Unit per trade = Allocation * LEVERAGE * 0.20 (Conservative entry within allocation)
             safe_equity = equity * 0.95
-            unit_usd = (safe_equity * LEVERAGE) * 0.20 
+            allocation_per_asset = safe_equity / max(1, asset_count)
+            unit_usd = (allocation_per_asset * LEVERAGE) * 0.20 
+            
             qty = unit_usd / current_price
             qty = self._round_to_step(qty, specs["sizeStep"])
 
             if qty < specs["sizeStep"]:
-                bot_log("Calculated quantity too small.", level="warning")
+                bot_log(f"[{symbol_upper}] Qty too small ({qty}).", level="warning")
                 return
 
             # Cancel Existing Orders (Fresh Start for Grid)
@@ -261,9 +308,8 @@ class OctopusGridBot:
             # Place LONG Entry (Limit Buy at line_below)
             if line_below:
                 price = self._round_to_step(line_below, specs["tickSize"])
-                # Ensure we aren't placing a limit buy above current price (that would be market)
                 if price < current_price:
-                    bot_log(f"Placing BUY LMT @ {price}")
+                    bot_log(f"[{symbol_upper}] Placing BUY LMT @ {price} (Qty: {qty})")
                     self.kf.send_order({
                         "orderType": "lmt", "symbol": symbol_lower, "side": "buy",
                         "size": qty, "limitPrice": price
@@ -272,9 +318,8 @@ class OctopusGridBot:
             # Place SHORT Entry (Limit Sell at line_above)
             if line_above:
                 price = self._round_to_step(line_above, specs["tickSize"])
-                # Ensure we aren't placing a limit sell below current price
                 if price > current_price:
-                    bot_log(f"Placing SELL LMT @ {price}")
+                    bot_log(f"[{symbol_upper}] Placing SELL LMT @ {price} (Qty: {qty})")
                     self.kf.send_order({
                         "orderType": "lmt", "symbol": symbol_lower, "side": "sell",
                         "size": qty, "limitPrice": price
@@ -283,19 +328,14 @@ class OctopusGridBot:
         else:
             # --- 2. IN POSITION: Manage Exits (SL/TP) ---
             
-            # Strategy Dictate: "Check if filled, place stop and profit"
-            # We must ignore grid lines while in trade.
-            
-            # First, Cancel any lingering Entry Limits to prevent adding to position improperly
+            # First, Cancel any lingering Entry Limits
             try:
                 open_orders = self.kf.get_open_orders().get("openOrders", [])
                 for o in open_orders:
-                    # Cancel if it's a Limit order (Entry) or if it's for the wrong side
-                    # Ideally, we just want to keep the TP/SL for the current position
                     if o["symbol"] == symbol_lower and o["orderType"] == "lmt":
                         self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
             except Exception as e:
-                bot_log(f"Cleanup error: {e}", level="warning")
+                bot_log(f"[{symbol_upper}] Cleanup error: {e}", level="warning")
 
             # Check for existing protective orders
             has_sl = False
