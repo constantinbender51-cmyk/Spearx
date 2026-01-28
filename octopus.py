@@ -39,7 +39,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 # Global Settings
 MAX_WORKERS = 16
 LEVERAGE = 10
-TEST_ASSET_LIMIT = 100  # Limit execution to 4 assets for testing
+TEST_ASSET_LIMIT = 4  # Limit execution to 4 assets for testing
 
 # Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
@@ -331,7 +331,6 @@ class OctopusGridBot:
                 for o in open_orders:
                     if o["symbol"].lower() == symbol_lower and o["orderType"] == "lmt":
                         # We cancel basic limits, but keep Take Profits (if they are type 'lmt' with reduceOnly)
-                        # The check below handles TP existence. For now, strict cleanup of old grid orders:
                         if not o.get("reduceOnly", False):
                             self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
             except Exception as e:
@@ -371,7 +370,7 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] Adding Brackets | Entry: {entry_price} | SL: {sl_price} | TP: {tp_price}")
 
-        # STOP LOSS: 'stp' type but WITH limitPrice as requested
+        # STOP LOSS: 'stp' type with mandatory limitPrice
         try:
             sl_resp = self.kf.send_order({
                 "orderType": "stp", 
@@ -379,7 +378,7 @@ class OctopusGridBot:
                 "side": side, 
                 "size": abs_size, 
                 "stopPrice": sl_price, 
-                [span_6](start_span)"limitPrice": sl_price, # REQUIRED: limitPrice denotes the worst fill price for STP orders[span_6](end_span)
+                "limitPrice": sl_price, # Required per instructions: defines worst fill price
                 "reduceOnly": True
             })
             print(f"DEBUG_SL_RESPONSE [{symbol.upper()}]: {sl_resp}")
@@ -389,11 +388,11 @@ class OctopusGridBot:
         # TAKE PROFIT: 'lmt' type with limitPrice
         try:
             tp_resp = self.kf.send_order({
-                [span_7](start_span)"orderType": "lmt", #[span_7](end_span)
+                "orderType": "lmt", 
                 "symbol": symbol, 
                 "side": side, 
                 "size": abs_size, 
-                [span_8](start_span)[span_9](start_span)"limitPrice": tp_price, #[span_8](end_span)[span_9](end_span)
+                "limitPrice": tp_price, 
                 "reduceOnly": True
             })
             print(f"DEBUG_TP_RESPONSE [{symbol.upper()}]: {tp_resp}")
