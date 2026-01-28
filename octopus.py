@@ -39,6 +39,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 # Global Settings
 MAX_WORKERS = 16
 LEVERAGE = 10
+TEST_ASSET_LIMIT = 4  # Limit execution to 4 assets for testing
 
 # Strategy Endpoint (The app.py server)
 STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
@@ -225,13 +226,21 @@ class OctopusGridBot:
             bot_log(f"Account fetch failed: {e}", level="error")
             return
 
-        # 3. Determine Execution Size per Asset
-        active_assets_count = len(all_params)
+        # 3. Determine Execution Size per Asset (TESTING LIMIT APPLIED HERE)
+        # We filter the dictionary down to the first TEST_ASSET_LIMIT items
+        limited_keys = list(all_params.keys())[:TEST_ASSET_LIMIT]
+        limited_params = {k: all_params[k] for k in limited_keys}
+        
+        active_assets_count = len(limited_params)
+        
+        bot_log(f"TEST MODE: Limiting active assets to {active_assets_count}: {limited_keys}")
+        
         if active_assets_count == 0: return
         
         # 4. Execute Logic for Each Asset
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for app_symbol, params in all_params.items():
+            # We iterate over limited_params instead of all_params
+            for app_symbol, params in limited_params.items():
                 kraken_symbol = SYMBOL_MAP.get(app_symbol)
                 
                 if not kraken_symbol:
