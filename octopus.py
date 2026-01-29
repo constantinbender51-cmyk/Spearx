@@ -328,8 +328,7 @@ class OctopusGridBot:
                     # Extract Type safely (check 'orderType' OR 'type')
                     o_type = o.get("orderType", o.get("type", "")).lower()
                     o_reduce = o.get("reduceOnly", False)
-                    # Check for Trigger details (common in Kraken Futures v3 for Stops)
-                    o_trigger = o.get("triggerSignal", None)
+                    o_trigger = o.get("triggerSignal", None) # Trigger Signal check
                     o_stop_px = o.get("stopPrice", None)
                     
                     # 1. Cleanup old grid limits (LMT without reduceOnly)
@@ -341,19 +340,19 @@ class OctopusGridBot:
                             bot_log(f"[{symbol_upper}] Cancel Failed {o['order_id']}: {e}", level="error")
                         continue
 
-                    # 2. Check for SL (stp OR triggered lmt)
-                    # Kraken often returns stops as 'lmt' with a 'triggerSignal' field
+                    # 2. Check for SL (stp OR trigger-based lmt)
+                    # We check for 'stp' OR if it has a stopPrice OR triggers
                     is_sl_order = (
                         o_type == "stp" or 
                         o_stop_px is not None or 
-                        o_trigger is not None  # Key fix: Check for trigger signal
+                        o_trigger is not None
                     )
-                    
+
                     if is_sl_order:
                         has_sl = True
                         
                     # 3. Check for TP (lmt + reduceOnly + NO trigger)
-                    # Ensure we don't count a Triggered Stop as a TP
+                    # Note: API might return type "take_profit" if sent as such, but we sent as lmt
                     is_tp_order = (
                         (o_type == "lmt" and o_reduce and o_trigger is None) or 
                         o_type == "take_profit"
@@ -386,20 +385,21 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] Adding Brackets | Entry: {entry_price} | SL: {sl_price} | TP: {tp_price}")
 
-        # STOP LOSS
+        # STOP LOSS - MARKET STOP (No limitPrice)
         try:
-            sl_resp = self.kf.send_order({
+            sl_payload = {
                 "orderType": "stp", 
                 "symbol": symbol, 
                 "side": side, 
                 "size": abs_size, 
                 "stopPrice": sl_price, 
-                "limitPrice": sl_price, 
+                # "limitPrice": sl_price,  <-- REMOVED to ensure Market Stop behavior
                 "triggerSignal": "mark", 
                 "reduceOnly": True
-            })
+            }
+            sl_resp = self.kf.send_order(sl_payload)
             bot_log(f"[{symbol.upper()}] SL Response: {sl_resp}")
-            # Log result briefly
+            
             if "error" in sl_resp and sl_resp["error"]:
                  bot_log(f"[{symbol.upper()}] SL API Error: {sl_resp['error']}", level="error")
             time.sleep(0.3)
