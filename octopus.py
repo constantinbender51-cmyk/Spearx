@@ -3,7 +3,7 @@
 Octopus Grid: Execution Engine for GA Grid Strategy
 - Source: Connects to app.py endpoint (/api/parameters)
 - Logic: Grid Entry (Nearest Lines) + Dynamic SL/TP
-- Schedule: Entry (1 min), Protection (3 sec)
+- Schedule: Entry (1 min), Protection & Cleanup (3 sec)
 - Assets: Multi-Asset Support (Maps app.py symbols to Kraken Futures)
 """
 
@@ -83,10 +83,6 @@ def bot_log(msg, level="info"):
 
 class GridParamFetcher:
     def fetch_all_params(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Fetches ALL parameters from the GA server.
-        """
-        # Reduced logging to avoid spamming on the fast loop if called frequently
         try:
             resp = requests.get(STRATEGY_URL, timeout=5)
             if resp.status_code == 200:
@@ -113,11 +109,11 @@ class OctopusGridBot:
         self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
         self.fetcher = GridParamFetcher()
         self.instrument_specs = {}
-        self.active_params = {} # Shared state for Entry/Exit logic
+        self.active_params = {}
         self.param_lock = threading.Lock()
 
     def initialize(self):
-        bot_log("--- Initializing Octopus Grid Bot (Fast Protect Mode) ---")
+        bot_log("--- Initializing Octopus Grid Bot (Fast Protect & Cleanup) ---")
         
         self._fetch_instrument_specs()
         
@@ -129,7 +125,6 @@ class OctopusGridBot:
             else:
                 bot_log("API Connection Successful.")
 
-            # --- 1. Cancel All Orders on Startup (Throttled) ---
             bot_log("Startup: Canceling all open orders for mapped assets...")
             unique_symbols = set(SYMBOL_MAP.values())
             
@@ -174,35 +169,32 @@ class OctopusGridBot:
         while True:
             cycle_start = time.time()
             
-            # --- 1. Fast Loop: Exit & Protection Monitor ---
-            # Checks for fills and places SL/TP immediately
+            # --- 1. Fast Loop: Exit Monitor, Protection & Cleanup ---
             self._monitor_exits()
             
             # --- 2. Slow Loop: Entry Grid Logic ---
-            # Runs only within the :05-:10 second window of the minute
             dt_now = datetime.now(timezone.utc)
             if dt_now.second >= 5 and dt_now.second < 10:
-                # Debounce to ensure it only runs once per window
                 if cycle_start - last_entry_run > 45:
                     bot_log(f">>> ENTRY TRIGGER: {dt_now.strftime('%H:%M:%S')} <<<")
                     self._process_entry_cycle()
                     last_entry_run = time.time()
             
-            # Sleep briefly to allow frequent exit polling
             time.sleep(3)
 
-    # --- Fast Loop Logic (Exits) ---
+    # --- Fast Loop Logic (Exits & Cleanup) ---
 
     def _monitor_exits(self):
         """
-        Fetches ALL positions/orders/tickers in bulk and checks if any 
-        position lacks a corresponding Stop Loss or Take Profit.
+        Fetches ALL data.
+        If Position exists:
+          1. CANCEL old Entry orders (Cleanup).
+          2. PLACE SL/TP if missing (Protection).
         """
         if not self.active_params:
             return
 
         try:
-            # Bulk fetch to minimize latency
             raw_pos = self.kf.get_open_positions()
             raw_ord = self.kf.get_open_orders()
             raw_tick = self.kf.get_tickers()
@@ -212,14 +204,12 @@ class OctopusGridBot:
 
         pos_map = {p["symbol"].upper(): p for p in raw_pos.get("openPositions", [])}
         
-        # Organize orders by symbol
         ord_map = {}
         for o in raw_ord.get("openOrders", []):
             s = o["symbol"].upper()
             if s not in ord_map: ord_map[s] = []
             ord_map[s].append(o)
             
-        # Organize tickers by symbol
         tick_map = {t["symbol"].upper(): float(t["markPrice"]) for t in raw_tick.get("tickers", [])}
 
         with self.param_lock:
@@ -231,7 +221,7 @@ class OctopusGridBot:
             
             sym_upper = kraken_symbol.upper()
             
-            # If we have a position, ensure protection
+            # We have a position?
             if sym_upper in pos_map:
                 p_data = pos_map[sym_upper]
                 size = float(p_data["size"])
@@ -241,7 +231,7 @@ class OctopusGridBot:
                 current_price = tick_map.get(sym_upper, 0.0)
                 if current_price == 0: continue
 
-                self._ensure_bracket(
+                self._manage_active_position(
                     kraken_symbol, 
                     size, 
                     entry, 
@@ -250,9 +240,12 @@ class OctopusGridBot:
                     params
                 )
 
-    def _ensure_bracket(self, symbol_str: str, pos_size: float, entry_price: float, 
-                        current_price: float, open_orders: List, params: Dict):
-        
+    def _manage_active_position(self, symbol_str: str, pos_size: float, entry_price: float, 
+                                current_price: float, open_orders: List, params: Dict):
+        """
+        1. Identifies and cancels 'Stale' Entry orders (unfilled limits).
+        2. Checks for and places missing SL/TP.
+        """
         symbol_lower = symbol_str.lower()
         symbol_upper = symbol_str.upper()
         stop_pct = params["stop_percent"]
@@ -262,14 +255,23 @@ class OctopusGridBot:
 
         has_sl = False
         has_tp = False
+        stale_entry_ids = []
 
-        # Scan existing orders
+        # Analyze existing orders
         for o in open_orders:
             o_type = o.get("orderType", o.get("type", "")).lower()
             o_reduce = o.get("reduceOnly", False)
             o_trigger = o.get("triggerSignal", None)
             o_stop_px = o.get("stopPrice", None)
+            o_id = o.get("order_id")
             
+            # DEFINITION: Stale Entry Order
+            # It is a Limit order, NOT reduceOnly, and has NO trigger signal.
+            # If we are in a position, these should NOT exist.
+            is_entry_order = (o_type == "lmt" and not o_reduce and o_trigger is None)
+            if is_entry_order:
+                stale_entry_ids.append(o_id)
+
             # Check for SL (stp OR trigger-based)
             is_sl_order = (o_type == "stp" or o_stop_px is not None or o_trigger is not None)
             if is_sl_order: has_sl = True
@@ -278,7 +280,16 @@ class OctopusGridBot:
             is_tp_order = ((o_type == "lmt" and o_reduce and o_trigger is None) or o_type == "take_profit")
             if is_tp_order: has_tp = True
 
-        # If missing protection, place it immediately
+        # --- STEP 1: CLEANUP (Cancel Stale Entries) ---
+        if stale_entry_ids:
+            bot_log(f"[{symbol_upper}] Position detected. Cleaning up {len(stale_entry_ids)} stale entry orders.")
+            for oid in stale_entry_ids:
+                try:
+                    self.kf.cancel_order({"order_id": oid, "symbol": symbol_lower})
+                except Exception as e:
+                    bot_log(f"[{symbol_upper}] Cleanup Failed ID {oid}: {e}", level="warning")
+
+        # --- STEP 2: PROTECTION (Ensure SL/TP) ---
         if not has_sl or not has_tp:
             self._place_bracket_orders(
                 symbol_lower, pos_size, entry_price, current_price,
@@ -303,7 +314,7 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] PROTECTION MISSING. Placing Brackets | SL: {sl_price} | TP: {tp_price}")
 
-        # --- EMERGENCY CHECK ---
+        # Emergency Check
         sl_breached = False
         if is_long and current_price <= sl_price: sl_breached = True
         elif not is_long and current_price >= sl_price: sl_breached = True
@@ -342,10 +353,8 @@ class OctopusGridBot:
     def _process_entry_cycle(self):
         new_params = self.fetcher.fetch_all_params()
         if not new_params:
-            bot_log("No params received. Skipping entry cycle.", level="warning")
             return
         
-        # Update shared params for the fast loop
         with self.param_lock:
             self.active_params = new_params
         
@@ -357,11 +366,8 @@ class OctopusGridBot:
                 first_acc = list(acc.get("accounts", {}).values())[0]
                 equity = float(first_acc.get("marginEquity", 0))
                 
-            if equity <= 0:
-                bot_log("Equity <= 0. Aborting.", level="error")
-                return
-        except Exception as e:
-            bot_log(f"Account fetch failed: {e}", level="error")
+            if equity <= 0: return
+        except Exception:
             return
 
         limited_keys = list(new_params.keys())[:TEST_ASSET_LIMIT]
@@ -370,7 +376,6 @@ class OctopusGridBot:
         
         if active_assets_count == 0: return
         
-        # Threaded Entry Execution
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             for app_symbol, params in limited_params.items():
                 kraken_symbol = SYMBOL_MAP.get(app_symbol)
@@ -385,10 +390,6 @@ class OctopusGridBot:
                 )
 
     def _execute_entry_logic(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
-        """
-        Only handles LIMIT ENTRY orders for FLAT positions.
-        Does NOT handle SL/TP (handled by _monitor_exits).
-        """
         time.sleep(random.uniform(0.1, 1.5))
         
         symbol_upper = symbol_str.upper()
@@ -398,8 +399,6 @@ class OctopusGridBot:
         specs = self.instrument_specs.get(symbol_upper)
         if not specs: return
 
-        # We fetch specific position details here just to verify if we are flat
-        # Note: This duplicates some IO but is necessary for accurate entry logic
         pos_size, _ = self._get_position_details(symbol_upper)
         current_price = self._get_mark_price(symbol_upper)
         
@@ -425,11 +424,9 @@ class OctopusGridBot:
                 bot_log(f"[{symbol_upper}] Qty too small ({qty}).", level="warning")
                 return
 
-            # Cleanup old orders before placing new ones
             try: self.kf.cancel_all_orders({"symbol": symbol_lower})
             except: pass
             
-            # Place BUY Limit
             if line_below:
                 price = self._round_to_step(line_below, specs["tickSize"])
                 if price < current_price:
@@ -440,7 +437,6 @@ class OctopusGridBot:
             
             time.sleep(0.3)
 
-            # Place SELL Limit
             if line_above:
                 price = self._round_to_step(line_above, specs["tickSize"])
                 if price > current_price:
@@ -448,9 +444,7 @@ class OctopusGridBot:
                         "orderType": "lmt", "symbol": symbol_lower, "side": "sell",
                         "size": qty, "limitPrice": price
                     })
-        else:
-            # If in position, do nothing here. The _monitor_exits loop handles safety.
-            pass
+        # If not flat, do nothing. The fast loop handles cleanup/protection.
 
     # --- Helpers ---
 
@@ -465,8 +459,7 @@ class OctopusGridBot:
                         entry = float(p["price"])
                         return size, entry
             return 0.0, 0.0
-        except Exception as e:
-            bot_log(f"[{kf_symbol_upper}] Position Fetch Error: {e}", level="error")
+        except Exception:
             return 0.0, 0.0
 
     def _get_mark_price(self, kf_symbol_upper: str) -> float:
@@ -476,8 +469,7 @@ class OctopusGridBot:
                 if t["symbol"].upper() == kf_symbol_upper:
                     return float(t["markPrice"])
             return 0.0
-        except Exception as e:
-            bot_log(f"[{kf_symbol_upper}] Ticker Fetch Error: {e}", level="error")
+        except Exception:
             return 0.0
 
 if __name__ == "__main__":
