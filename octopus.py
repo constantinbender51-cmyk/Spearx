@@ -365,11 +365,12 @@ class OctopusGridBot:
                 line_above = grid_lines[idx] if idx < len(grid_lines) else None
 
                 self._place_bracket_orders(
-                    symbol_lower, pos_size, entry_price, stop_pct, profit_pct, 
-                    specs["tickSize"], line_below, line_above
+                    symbol_lower, pos_size, entry_price, current_price,
+                    stop_pct, profit_pct, specs["tickSize"], 
+                    line_below, line_above
                 )
 
-    def _place_bracket_orders(self, symbol: str, position_size: float, entry_price: float, 
+    def _place_bracket_orders(self, symbol: str, position_size: float, entry_price: float, current_price: float,
                               sl_pct: float, tp_pct: float, tick_size: float,
                               lower_band: float=None, upper_band: float=None):
         is_long = position_size > 0
@@ -388,7 +389,30 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] Adding Brackets | Bands: {lower_band} - {upper_band} | SL: {sl_price} | TP: {tp_price}")
 
-        # STOP LOSS - MARKET STOP (No limitPrice)
+        # --- EMERGENCY CHECK: Is Stop Already Breached? ---
+        sl_breached = False
+        if is_long and current_price <= sl_price:
+            sl_breached = True
+        elif not is_long and current_price >= sl_price:
+            sl_breached = True
+
+        if sl_breached:
+            bot_log(f"[{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Executing Market Close.")
+            try:
+                # Execute Market Order to Close
+                mkt_resp = self.kf.send_order({
+                    "orderType": "mkt",
+                    "symbol": symbol,
+                    "side": side,
+                    "size": abs_size,
+                    "reduceOnly": True
+                })
+                bot_log(f"[{symbol.upper()}] Emergency Close Response: {mkt_resp}")
+            except Exception as e:
+                 bot_log(f"[{symbol.upper()}] Emergency Close Failed: {e}", level="error")
+            return # Exit function, do not place TP if we are closing out
+
+        # --- NORMAL STOP LOSS (Market Stop) ---
         try:
             sl_payload = {
                 "orderType": "stp", 
@@ -396,7 +420,7 @@ class OctopusGridBot:
                 "side": side, 
                 "size": abs_size, 
                 "stopPrice": sl_price, 
-                # "limitPrice": sl_price,  <-- REMOVED to ensure Market Stop behavior
+                # "limitPrice": sl_price,  <-- REMOVED
                 "triggerSignal": "mark", 
                 "reduceOnly": True
             }
@@ -409,7 +433,7 @@ class OctopusGridBot:
         except Exception as e:
             bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
 
-        # TAKE PROFIT
+        # --- NORMAL TAKE PROFIT ---
         try:
             tp_resp = self.kf.send_order({
                 "orderType": "lmt", 
