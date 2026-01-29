@@ -315,10 +315,6 @@ class OctopusGridBot:
             try:
                 open_orders = self.kf.get_open_orders().get("openOrders", [])
                 
-                # --- DEBUG: Print one order to see structure ---
-                # if open_orders: bot_log(f"DEBUG {symbol_upper} Order[0]: {open_orders[0]}")
-                # -----------------------------------------------
-
                 for o in open_orders:
                     # Robust Symbol Check
                     o_sym = o.get("symbol", "").lower()
@@ -341,7 +337,6 @@ class OctopusGridBot:
                         continue
 
                     # 2. Check for SL (stp OR trigger-based lmt)
-                    # We check for 'stp' OR if it has a stopPrice OR triggers
                     is_sl_order = (
                         o_type == "stp" or 
                         o_stop_px is not None or 
@@ -352,7 +347,6 @@ class OctopusGridBot:
                         has_sl = True
                         
                     # 3. Check for TP (lmt + reduceOnly + NO trigger)
-                    # Note: API might return type "take_profit" if sent as such, but we sent as lmt
                     is_tp_order = (
                         (o_type == "lmt" and o_reduce and o_trigger is None) or 
                         o_type == "take_profit"
@@ -365,10 +359,19 @@ class OctopusGridBot:
                 bot_log(f"[{symbol_upper}] Order Check Error: {e}", level="error")
 
             if not has_sl or not has_tp:
-                self._place_bracket_orders(symbol_lower, pos_size, entry_price, stop_pct, profit_pct, specs["tickSize"])
+                # Find current grid bands to log them
+                idx = np.searchsorted(grid_lines, current_price)
+                line_below = grid_lines[idx-1] if idx > 0 else None
+                line_above = grid_lines[idx] if idx < len(grid_lines) else None
+
+                self._place_bracket_orders(
+                    symbol_lower, pos_size, entry_price, stop_pct, profit_pct, 
+                    specs["tickSize"], line_below, line_above
+                )
 
     def _place_bracket_orders(self, symbol: str, position_size: float, entry_price: float, 
-                              sl_pct: float, tp_pct: float, tick_size: float):
+                              sl_pct: float, tp_pct: float, tick_size: float,
+                              lower_band: float=None, upper_band: float=None):
         is_long = position_size > 0
         side = "sell" if is_long else "buy"
         abs_size = abs(position_size)
@@ -383,7 +386,7 @@ class OctopusGridBot:
         sl_price = self._round_to_step(sl_price, tick_size)
         tp_price = self._round_to_step(tp_price, tick_size)
 
-        bot_log(f"[{symbol.upper()}] Adding Brackets | Entry: {entry_price} | SL: {sl_price} | TP: {tp_price}")
+        bot_log(f"[{symbol.upper()}] Adding Brackets | Bands: {lower_band} - {upper_band} | SL: {sl_price} | TP: {tp_price}")
 
         # STOP LOSS - MARKET STOP (No limitPrice)
         try:
