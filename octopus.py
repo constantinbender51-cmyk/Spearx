@@ -399,7 +399,7 @@ class OctopusGridBot:
             
             safe_equity = equity * 0.95
             allocation_per_asset = safe_equity / max(1, asset_count)
-            unit_usd = (allocation_per_asset * LEVERAGE) * 0.20 
+            unit_usd = (allocation_per_asset * LEVERAGE)
             
             qty = unit_usd / current_price
             qty = self._round_to_step(qty, specs["sizeStep"])
