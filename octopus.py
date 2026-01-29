@@ -332,8 +332,10 @@ class OctopusGridBot:
                     # 1. Cleanup old grid limits (LMT without reduceOnly)
                     if o_type == "lmt" and not o_reduce:
                         try:
-                            self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
-                        except: pass
+                            c_resp = self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
+                            bot_log(f"[{symbol_upper}] Cancelled Old Order {o['order_id']}: {c_resp}")
+                        except Exception as e:
+                            bot_log(f"[{symbol_upper}] Cancel Failed {o['order_id']}: {e}", level="error")
                         continue
 
                     # 2. Check for SL (stp)
@@ -382,6 +384,7 @@ class OctopusGridBot:
                 "triggerSignal": "mark", 
                 "reduceOnly": True
             })
+            bot_log(f"[{symbol.upper()}] SL Response: {sl_resp}")
             # Log result briefly
             if "error" in sl_resp and sl_resp["error"]:
                  bot_log(f"[{symbol.upper()}] SL API Error: {sl_resp['error']}", level="error")
