@@ -314,6 +314,22 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] PROTECTION MISSING. Placing Brackets | SL: {sl_price} | TP: {tp_price}")
 
+        # Emergency Check
+        sl_breached = False
+        if is_long and current_price <= sl_price: sl_breached = True
+        elif not is_long and current_price >= sl_price: sl_breached = True
+
+        if sl_breached:
+            bot_log(f"[{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Market Close.")
+            try:
+                self.kf.send_order({
+                    "orderType": "mkt", "symbol": symbol, "side": side,
+                    "size": abs_size, "reduceOnly": True
+                })
+            except Exception as e:
+                 bot_log(f"[{symbol.upper()}] Emergency Close Failed: {e}", level="error")
+            return
+
         # Place SL
         try:
             self.kf.send_order({
@@ -380,9 +396,6 @@ class OctopusGridBot:
         symbol_lower = symbol_str.lower()
         
         grid_lines = np.sort(np.array(params["line_prices"]))
-        stop_pct = params.get("stop_percent", 0.01)
-        profit_pct = params.get("profit_percent", 0.01)
-
         specs = self.instrument_specs.get(symbol_upper)
         if not specs: return
 
@@ -417,15 +430,9 @@ class OctopusGridBot:
             if line_below:
                 price = self._round_to_step(line_below, specs["tickSize"])
                 if price < current_price:
-                    # Calculate Stop/TP based on Entry Price
-                    sl_price = self._round_to_step(price * (1 - stop_pct), specs["tickSize"])
-                    tp_price = self._round_to_step(price * (1 + profit_pct), specs["tickSize"])
-
                     self.kf.send_order({
                         "orderType": "lmt", "symbol": symbol_lower, "side": "buy",
-                        "size": qty, "limitPrice": price,
-                        "stopLoss": {"stopPrice": sl_price, "triggerSignal": "mark"},
-                        "takeProfit": {"limitPrice": tp_price, "triggerSignal": "mark"}
+                        "size": qty, "limitPrice": price
                     })
             
             time.sleep(0.3)
@@ -433,15 +440,9 @@ class OctopusGridBot:
             if line_above:
                 price = self._round_to_step(line_above, specs["tickSize"])
                 if price > current_price:
-                    # Calculate Stop/TP based on Entry Price
-                    sl_price = self._round_to_step(price * (1 + stop_pct), specs["tickSize"])
-                    tp_price = self._round_to_step(price * (1 - profit_pct), specs["tickSize"])
-
                     self.kf.send_order({
                         "orderType": "lmt", "symbol": symbol_lower, "side": "sell",
-                        "size": qty, "limitPrice": price,
-                        "stopLoss": {"stopPrice": sl_price, "triggerSignal": "mark"},
-                        "takeProfit": {"limitPrice": tp_price, "triggerSignal": "mark"}
+                        "size": qty, "limitPrice": price
                     })
         # If not flat, do nothing. The fast loop handles cleanup/protection.
 
