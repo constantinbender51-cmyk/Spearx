@@ -3,7 +3,7 @@
 Octopus Grid: Execution Engine for GA Grid Strategy
 - Source: Connects to app.py endpoint (/api/parameters)
 - Logic: Grid Entry (Nearest Lines) + Dynamic SL/TP
-- Schedule: Every 1 minute
+- Schedule: Entry (1 min), Protection (3 sec)
 - Assets: Multi-Asset Support (Maps app.py symbols to Kraken Futures)
 """
 
@@ -86,7 +86,7 @@ class GridParamFetcher:
         """
         Fetches ALL parameters from the GA server.
         """
-        bot_log(f"Fetching grid params from {STRATEGY_URL}...")
+        # Reduced logging to avoid spamming on the fast loop if called frequently
         try:
             resp = requests.get(STRATEGY_URL, timeout=5)
             if resp.status_code == 200:
@@ -98,11 +98,8 @@ class GridParamFetcher:
                             if "line_prices" in params and "stop_percent" in params:
                                 valid_strategies[sym] = params
                         except TypeError:
-                            bot_log(f"Skipping invalid entry '{sym}': Data was not a dict", level="warning")
                             continue
                     return valid_strategies
-                else:
-                    bot_log("Invalid JSON structure from server.", level="warning")
             else:
                 bot_log(f"HTTP Error {resp.status_code}", level="warning")
         except Exception as e:
@@ -116,9 +113,11 @@ class OctopusGridBot:
         self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
         self.fetcher = GridParamFetcher()
         self.instrument_specs = {}
+        self.active_params = {} # Shared state for Entry/Exit logic
+        self.param_lock = threading.Lock()
 
     def initialize(self):
-        bot_log("--- Initializing Octopus Grid Bot (Multi-Asset 1m Cycle) ---")
+        bot_log("--- Initializing Octopus Grid Bot (Fast Protect Mode) ---")
         
         self._fetch_instrument_specs()
         
@@ -137,11 +136,9 @@ class OctopusGridBot:
             for i, sym in enumerate(unique_symbols):
                 try:
                     self.kf.cancel_all_orders({"symbol": sym.lower()})
-                    bot_log(f"[{i+1}/{len(unique_symbols)}] Cancelled orders for {sym}")
-                    time.sleep(1.2) 
+                    time.sleep(1.0) 
                 except Exception as e:
                     bot_log(f"Failed to cancel {sym}: {e}", level="warning")
-                    time.sleep(2.0) 
                     
         except Exception as e:
             bot_log(f"Startup Failed: {e}", level="error")
@@ -170,6 +167,293 @@ class OctopusGridBot:
         rounded = round(value / step) * step
         return float(f"{rounded:.10g}")
 
+    def run(self):
+        bot_log("Bot started. Running Dual-Loop: Entries (1m), Exits (3s).")
+        last_entry_run = 0
+
+        while True:
+            cycle_start = time.time()
+            
+            # --- 1. Fast Loop: Exit & Protection Monitor ---
+            # Checks for fills and places SL/TP immediately
+            self._monitor_exits()
+            
+            # --- 2. Slow Loop: Entry Grid Logic ---
+            # Runs only within the :05-:10 second window of the minute
+            dt_now = datetime.now(timezone.utc)
+            if dt_now.second >= 5 and dt_now.second < 10:
+                # Debounce to ensure it only runs once per window
+                if cycle_start - last_entry_run > 45:
+                    bot_log(f">>> ENTRY TRIGGER: {dt_now.strftime('%H:%M:%S')} <<<")
+                    self._process_entry_cycle()
+                    last_entry_run = time.time()
+            
+            # Sleep briefly to allow frequent exit polling
+            time.sleep(3)
+
+    # --- Fast Loop Logic (Exits) ---
+
+    def _monitor_exits(self):
+        """
+        Fetches ALL positions/orders/tickers in bulk and checks if any 
+        position lacks a corresponding Stop Loss or Take Profit.
+        """
+        if not self.active_params:
+            return
+
+        try:
+            # Bulk fetch to minimize latency
+            raw_pos = self.kf.get_open_positions()
+            raw_ord = self.kf.get_open_orders()
+            raw_tick = self.kf.get_tickers()
+        except Exception as e:
+            bot_log(f"Monitor Fetch Error: {e}", level="error")
+            return
+
+        pos_map = {p["symbol"].upper(): p for p in raw_pos.get("openPositions", [])}
+        
+        # Organize orders by symbol
+        ord_map = {}
+        for o in raw_ord.get("openOrders", []):
+            s = o["symbol"].upper()
+            if s not in ord_map: ord_map[s] = []
+            ord_map[s].append(o)
+            
+        # Organize tickers by symbol
+        tick_map = {t["symbol"].upper(): float(t["markPrice"]) for t in raw_tick.get("tickers", [])}
+
+        with self.param_lock:
+            current_params = self.active_params.copy()
+
+        for app_symbol, params in current_params.items():
+            kraken_symbol = SYMBOL_MAP.get(app_symbol)
+            if not kraken_symbol: continue
+            
+            sym_upper = kraken_symbol.upper()
+            
+            # If we have a position, ensure protection
+            if sym_upper in pos_map:
+                p_data = pos_map[sym_upper]
+                size = float(p_data["size"])
+                if p_data["side"] == "short": size = -size
+                entry = float(p_data["price"])
+                
+                current_price = tick_map.get(sym_upper, 0.0)
+                if current_price == 0: continue
+
+                self._ensure_bracket(
+                    kraken_symbol, 
+                    size, 
+                    entry, 
+                    current_price, 
+                    ord_map.get(sym_upper, []), 
+                    params
+                )
+
+    def _ensure_bracket(self, symbol_str: str, pos_size: float, entry_price: float, 
+                        current_price: float, open_orders: List, params: Dict):
+        
+        symbol_lower = symbol_str.lower()
+        symbol_upper = symbol_str.upper()
+        stop_pct = params["stop_percent"]
+        profit_pct = params["profit_percent"]
+        specs = self.instrument_specs.get(symbol_upper)
+        if not specs: return
+
+        has_sl = False
+        has_tp = False
+
+        # Scan existing orders
+        for o in open_orders:
+            o_type = o.get("orderType", o.get("type", "")).lower()
+            o_reduce = o.get("reduceOnly", False)
+            o_trigger = o.get("triggerSignal", None)
+            o_stop_px = o.get("stopPrice", None)
+            
+            # Check for SL (stp OR trigger-based)
+            is_sl_order = (o_type == "stp" or o_stop_px is not None or o_trigger is not None)
+            if is_sl_order: has_sl = True
+            
+            # Check for TP (lmt + reduceOnly + NO trigger)
+            is_tp_order = ((o_type == "lmt" and o_reduce and o_trigger is None) or o_type == "take_profit")
+            if is_tp_order: has_tp = True
+
+        # If missing protection, place it immediately
+        if not has_sl or not has_tp:
+            self._place_bracket_orders(
+                symbol_lower, pos_size, entry_price, current_price,
+                stop_pct, profit_pct, specs["tickSize"]
+            )
+
+    def _place_bracket_orders(self, symbol: str, position_size: float, entry_price: float, current_price: float,
+                              sl_pct: float, tp_pct: float, tick_size: float):
+        is_long = position_size > 0
+        side = "sell" if is_long else "buy"
+        abs_size = abs(position_size)
+
+        if is_long:
+            sl_price = entry_price * (1 - sl_pct)
+            tp_price = entry_price * (1 + tp_pct)
+        else:
+            sl_price = entry_price * (1 + sl_pct)
+            tp_price = entry_price * (1 - tp_pct)
+
+        sl_price = self._round_to_step(sl_price, tick_size)
+        tp_price = self._round_to_step(tp_price, tick_size)
+
+        bot_log(f"[{symbol.upper()}] PROTECTION MISSING. Placing Brackets | SL: {sl_price} | TP: {tp_price}")
+
+        # --- EMERGENCY CHECK ---
+        sl_breached = False
+        if is_long and current_price <= sl_price: sl_breached = True
+        elif not is_long and current_price >= sl_price: sl_breached = True
+
+        if sl_breached:
+            bot_log(f"[{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Market Close.")
+            try:
+                self.kf.send_order({
+                    "orderType": "mkt", "symbol": symbol, "side": side,
+                    "size": abs_size, "reduceOnly": True
+                })
+            except Exception as e:
+                 bot_log(f"[{symbol.upper()}] Emergency Close Failed: {e}", level="error")
+            return
+
+        # Place SL
+        try:
+            self.kf.send_order({
+                "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
+                "stopPrice": sl_price, "triggerSignal": "mark", "reduceOnly": True
+            })
+        except Exception as e:
+            bot_log(f"[{symbol.upper()}] SL Placement Failed: {e}", level="error")
+
+        # Place TP
+        try:
+            self.kf.send_order({
+                "orderType": "lmt", "symbol": symbol, "side": side, "size": abs_size, 
+                "limitPrice": tp_price, "reduceOnly": True
+            })
+        except Exception as e:
+            bot_log(f"[{symbol.upper()}] TP Placement Failed: {e}", level="error")
+
+    # --- Slow Loop Logic (Entries) ---
+
+    def _process_entry_cycle(self):
+        new_params = self.fetcher.fetch_all_params()
+        if not new_params:
+            bot_log("No params received. Skipping entry cycle.", level="warning")
+            return
+        
+        # Update shared params for the fast loop
+        with self.param_lock:
+            self.active_params = new_params
+        
+        try:
+            acc = self.kf.get_accounts()
+            if "flex" in acc.get("accounts", {}):
+                equity = float(acc["accounts"]["flex"].get("marginEquity", 0))
+            else:
+                first_acc = list(acc.get("accounts", {}).values())[0]
+                equity = float(first_acc.get("marginEquity", 0))
+                
+            if equity <= 0:
+                bot_log("Equity <= 0. Aborting.", level="error")
+                return
+        except Exception as e:
+            bot_log(f"Account fetch failed: {e}", level="error")
+            return
+
+        limited_keys = list(new_params.keys())[:TEST_ASSET_LIMIT]
+        limited_params = {k: new_params[k] for k in limited_keys}
+        active_assets_count = len(limited_params)
+        
+        if active_assets_count == 0: return
+        
+        # Threaded Entry Execution
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for app_symbol, params in limited_params.items():
+                kraken_symbol = SYMBOL_MAP.get(app_symbol)
+                if not kraken_symbol: continue
+                
+                executor.submit(
+                    self._execute_entry_logic, 
+                    kraken_symbol, 
+                    equity, 
+                    params, 
+                    active_assets_count
+                )
+
+    def _execute_entry_logic(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
+        """
+        Only handles LIMIT ENTRY orders for FLAT positions.
+        Does NOT handle SL/TP (handled by _monitor_exits).
+        """
+        time.sleep(random.uniform(0.1, 1.5))
+        
+        symbol_upper = symbol_str.upper()
+        symbol_lower = symbol_str.lower()
+        
+        grid_lines = np.sort(np.array(params["line_prices"]))
+        specs = self.instrument_specs.get(symbol_upper)
+        if not specs: return
+
+        # We fetch specific position details here just to verify if we are flat
+        # Note: This duplicates some IO but is necessary for accurate entry logic
+        pos_size, _ = self._get_position_details(symbol_upper)
+        current_price = self._get_mark_price(symbol_upper)
+        
+        if current_price == 0: return
+
+        idx = np.searchsorted(grid_lines, current_price)
+        line_below = grid_lines[idx-1] if idx > 0 else None
+        line_above = grid_lines[idx] if idx < len(grid_lines) else None
+
+        is_flat = abs(pos_size) < specs["sizeStep"]
+        
+        if is_flat:
+            bot_log(f"[{symbol_upper}] Flat. Placing Grid Limits. Px: {current_price}")
+            
+            safe_equity = equity * 0.95
+            allocation_per_asset = safe_equity / max(1, asset_count)
+            unit_usd = (allocation_per_asset * LEVERAGE) * 0.20 
+            
+            qty = unit_usd / current_price
+            qty = self._round_to_step(qty, specs["sizeStep"])
+
+            if qty < specs["sizeStep"]:
+                bot_log(f"[{symbol_upper}] Qty too small ({qty}).", level="warning")
+                return
+
+            # Cleanup old orders before placing new ones
+            try: self.kf.cancel_all_orders({"symbol": symbol_lower})
+            except: pass
+            
+            # Place BUY Limit
+            if line_below:
+                price = self._round_to_step(line_below, specs["tickSize"])
+                if price < current_price:
+                    self.kf.send_order({
+                        "orderType": "lmt", "symbol": symbol_lower, "side": "buy",
+                        "size": qty, "limitPrice": price
+                    })
+            
+            time.sleep(0.3)
+
+            # Place SELL Limit
+            if line_above:
+                price = self._round_to_step(line_above, specs["tickSize"])
+                if price > current_price:
+                    self.kf.send_order({
+                        "orderType": "lmt", "symbol": symbol_lower, "side": "sell",
+                        "size": qty, "limitPrice": price
+                    })
+        else:
+            # If in position, do nothing here. The _monitor_exits loop handles safety.
+            pass
+
+    # --- Helpers ---
+
     def _get_position_details(self, kf_symbol_upper: str) -> Tuple[float, float]:
         try:
             open_pos = self.kf.get_open_positions()
@@ -195,255 +479,6 @@ class OctopusGridBot:
         except Exception as e:
             bot_log(f"[{kf_symbol_upper}] Ticker Fetch Error: {e}", level="error")
             return 0.0
-
-    def run(self):
-        bot_log("Bot started. Syncing to 1m intervals...")
-        while True:
-            now = datetime.now(timezone.utc)
-            if now.second >= 5 and now.second < 10:
-                bot_log(f">>> TRIGGER: {now.strftime('%H:%M:%S')} <<<")
-                self._process_cycle()
-                time.sleep(50) 
-            time.sleep(1)
-
-    def _process_cycle(self):
-        all_params = self.fetcher.fetch_all_params()
-        if not all_params:
-            bot_log("No params received. Skipping cycle.", level="warning")
-            return
-        
-        try:
-            acc = self.kf.get_accounts()
-            if "flex" in acc.get("accounts", {}):
-                equity = float(acc["accounts"]["flex"].get("marginEquity", 0))
-            else:
-                first_acc = list(acc.get("accounts", {}).values())[0]
-                equity = float(first_acc.get("marginEquity", 0))
-                
-            if equity <= 0:
-                bot_log("Equity <= 0. Aborting.", level="error")
-                return
-        except Exception as e:
-            bot_log(f"Account fetch failed: {e}", level="error")
-            return
-
-        limited_keys = list(all_params.keys())[:TEST_ASSET_LIMIT]
-        limited_params = {k: all_params[k] for k in limited_keys}
-        
-        active_assets_count = len(limited_params)
-        bot_log(f"Cycle: Processing {active_assets_count} assets with {MAX_WORKERS} workers.")
-        
-        if active_assets_count == 0: return
-        
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for app_symbol, params in limited_params.items():
-                kraken_symbol = SYMBOL_MAP.get(app_symbol)
-                if not kraken_symbol: continue
-                
-                executor.submit(
-                    self._execute_grid_logic, 
-                    kraken_symbol, 
-                    equity, 
-                    params, 
-                    active_assets_count
-                )
-
-    def _execute_grid_logic(self, symbol_str: str, equity: float, params: Dict, asset_count: int):
-        time.sleep(random.uniform(0.1, 1.5))
-        
-        symbol_upper = symbol_str.upper()
-        symbol_lower = symbol_str.lower()
-        
-        grid_lines = np.sort(np.array(params["line_prices"]))
-        stop_pct = params["stop_percent"]
-        profit_pct = params["profit_percent"]
-
-        specs = self.instrument_specs.get(symbol_upper)
-        if not specs: return
-
-        pos_size, entry_price = self._get_position_details(symbol_upper)
-        current_price = self._get_mark_price(symbol_upper)
-        
-        if current_price == 0: return
-
-        # --- Identify Grid Lines (Moved up for Logging) ---
-        idx = np.searchsorted(grid_lines, current_price)
-        line_below = grid_lines[idx-1] if idx > 0 else None
-        line_above = grid_lines[idx] if idx < len(grid_lines) else None
-
-        is_flat = abs(pos_size) < specs["sizeStep"]
-        
-        # LOGGING UPDATE: Added Lines: {line_below} / {line_above}
-        bot_log(f"[{symbol_upper}] Price: {current_price} | Lines: {line_below} / {line_above} | Pos: {pos_size} @ {entry_price}")
-
-        if is_flat:
-            safe_equity = equity * 0.95
-            allocation_per_asset = safe_equity / max(1, asset_count)
-            unit_usd = (allocation_per_asset * LEVERAGE) * 0.20 
-            
-            qty = unit_usd / current_price
-            qty = self._round_to_step(qty, specs["sizeStep"])
-
-            if qty < specs["sizeStep"]:
-                bot_log(f"[{symbol_upper}] Qty too small ({qty}).", level="warning")
-                return
-
-            try: self.kf.cancel_all_orders({"symbol": symbol_lower})
-            except: pass
-            
-            if line_below:
-                price = self._round_to_step(line_below, specs["tickSize"])
-                if price < current_price:
-                    self.kf.send_order({
-                        "orderType": "lmt", "symbol": symbol_lower, "side": "buy",
-                        "size": qty, "limitPrice": price
-                    })
-            
-            time.sleep(0.3) # Increased from 0.2s
-
-            if line_above:
-                price = self._round_to_step(line_above, specs["tickSize"])
-                if price > current_price:
-                    self.kf.send_order({
-                        "orderType": "lmt", "symbol": symbol_lower, "side": "sell",
-                        "size": qty, "limitPrice": price
-                    })
-
-        else:
-            # --- IN POSITION: Manage Exits ---
-            has_sl = False
-            has_tp = False
-            
-            try:
-                open_orders = self.kf.get_open_orders().get("openOrders", [])
-                
-                for o in open_orders:
-                    # Robust Symbol Check
-                    o_sym = o.get("symbol", "").lower()
-                    if o_sym != symbol_lower:
-                        continue
-                        
-                    # Extract Type safely (check 'orderType' OR 'type')
-                    o_type = o.get("orderType", o.get("type", "")).lower()
-                    o_reduce = o.get("reduceOnly", False)
-                    o_trigger = o.get("triggerSignal", None) # Trigger Signal check
-                    o_stop_px = o.get("stopPrice", None)
-                    
-                    # 1. Cleanup old grid limits (LMT without reduceOnly)
-                    if o_type == "lmt" and not o_reduce:
-                        try:
-                            c_resp = self.kf.cancel_order({"order_id": o["order_id"], "symbol": symbol_lower})
-                            bot_log(f"[{symbol_upper}] Cancelled Old Order {o['order_id']}: {c_resp}")
-                        except Exception as e:
-                            bot_log(f"[{symbol_upper}] Cancel Failed {o['order_id']}: {e}", level="error")
-                        continue
-
-                    # 2. Check for SL (stp OR trigger-based lmt)
-                    is_sl_order = (
-                        o_type == "stp" or 
-                        o_stop_px is not None or 
-                        o_trigger is not None
-                    )
-
-                    if is_sl_order:
-                        has_sl = True
-                        
-                    # 3. Check for TP (lmt + reduceOnly + NO trigger)
-                    is_tp_order = (
-                        (o_type == "lmt" and o_reduce and o_trigger is None) or 
-                        o_type == "take_profit"
-                    )
-
-                    if is_tp_order:
-                        has_tp = True
-
-            except Exception as e:
-                bot_log(f"[{symbol_upper}] Order Check Error: {e}", level="error")
-
-            if not has_sl or not has_tp:
-                self._place_bracket_orders(
-                    symbol_lower, pos_size, entry_price, current_price,
-                    stop_pct, profit_pct, specs["tickSize"], 
-                    line_below, line_above
-                )
-
-    def _place_bracket_orders(self, symbol: str, position_size: float, entry_price: float, current_price: float,
-                              sl_pct: float, tp_pct: float, tick_size: float,
-                              lower_band: float=None, upper_band: float=None):
-        is_long = position_size > 0
-        side = "sell" if is_long else "buy"
-        abs_size = abs(position_size)
-
-        if is_long:
-            sl_price = entry_price * (1 - sl_pct)
-            tp_price = entry_price * (1 + tp_pct)
-        else:
-            sl_price = entry_price * (1 + sl_pct)
-            tp_price = entry_price * (1 - tp_pct)
-
-        sl_price = self._round_to_step(sl_price, tick_size)
-        tp_price = self._round_to_step(tp_price, tick_size)
-
-        bot_log(f"[{symbol.upper()}] Adding Brackets | Bands: {lower_band} - {upper_band} | SL: {sl_price} | TP: {tp_price}")
-
-        # --- EMERGENCY CHECK: Is Stop Already Breached? ---
-        sl_breached = False
-        if is_long and current_price <= sl_price:
-            sl_breached = True
-        elif not is_long and current_price >= sl_price:
-            sl_breached = True
-
-        if sl_breached:
-            bot_log(f"[{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Executing Market Close.")
-            try:
-                # Execute Market Order to Close
-                mkt_resp = self.kf.send_order({
-                    "orderType": "mkt",
-                    "symbol": symbol,
-                    "side": side,
-                    "size": abs_size,
-                    "reduceOnly": True
-                })
-                bot_log(f"[{symbol.upper()}] Emergency Close Response: {mkt_resp}")
-            except Exception as e:
-                 bot_log(f"[{symbol.upper()}] Emergency Close Failed: {e}", level="error")
-            return # Exit function, do not place TP if we are closing out
-
-        # --- NORMAL STOP LOSS (Market Stop) ---
-        try:
-            sl_payload = {
-                "orderType": "stp", 
-                "symbol": symbol, 
-                "side": side, 
-                "size": abs_size, 
-                "stopPrice": sl_price, 
-                # "limitPrice": sl_price,  <-- REMOVED
-                "triggerSignal": "mark", 
-                "reduceOnly": True
-            }
-            sl_resp = self.kf.send_order(sl_payload)
-            bot_log(f"[{symbol.upper()}] SL Response: {sl_resp}")
-            
-            if "error" in sl_resp and sl_resp["error"]:
-                 bot_log(f"[{symbol.upper()}] SL API Error: {sl_resp['error']}", level="error")
-            time.sleep(0.4) # Increased from 0.3s
-        except Exception as e:
-            bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
-
-        # --- NORMAL TAKE PROFIT ---
-        try:
-            tp_resp = self.kf.send_order({
-                "orderType": "lmt", 
-                "symbol": symbol, 
-                "side": side, 
-                "size": abs_size, 
-                "limitPrice": tp_price, 
-                "reduceOnly": True
-            })
-            if "error" in tp_resp and tp_resp["error"]:
-                 bot_log(f"[{symbol.upper()}] TP API Error: {tp_resp['error']}", level="error")
-        except Exception as e:
-            bot_log(f"[{symbol.upper()}] TP Failed: {e}", level="error")
 
 if __name__ == "__main__":
     bot = OctopusGridBot()
