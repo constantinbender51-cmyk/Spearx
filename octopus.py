@@ -266,15 +266,17 @@ class OctopusGridBot:
         
         if current_price == 0: return
 
+        # --- Identify Grid Lines (Moved up for Logging) ---
+        idx = np.searchsorted(grid_lines, current_price)
+        line_below = grid_lines[idx-1] if idx > 0 else None
+        line_above = grid_lines[idx] if idx < len(grid_lines) else None
+
         is_flat = abs(pos_size) < specs["sizeStep"]
         
-        bot_log(f"[{symbol_upper}] Price: {current_price} | Pos: {pos_size} @ {entry_price}")
+        # LOGGING UPDATE: Added Lines: {line_below} / {line_above}
+        bot_log(f"[{symbol_upper}] Price: {current_price} | Lines: {line_below} / {line_above} | Pos: {pos_size} @ {entry_price}")
 
         if is_flat:
-            idx = np.searchsorted(grid_lines, current_price)
-            line_below = grid_lines[idx-1] if idx > 0 else None
-            line_above = grid_lines[idx] if idx < len(grid_lines) else None
-            
             safe_equity = equity * 0.95
             allocation_per_asset = safe_equity / max(1, asset_count)
             unit_usd = (allocation_per_asset * LEVERAGE) * 0.20 
@@ -297,7 +299,7 @@ class OctopusGridBot:
                         "size": qty, "limitPrice": price
                     })
             
-            time.sleep(0.2) 
+            time.sleep(0.3) # Increased from 0.2s
 
             if line_above:
                 price = self._round_to_step(line_above, specs["tickSize"])
@@ -359,11 +361,6 @@ class OctopusGridBot:
                 bot_log(f"[{symbol_upper}] Order Check Error: {e}", level="error")
 
             if not has_sl or not has_tp:
-                # Find current grid bands to log them
-                idx = np.searchsorted(grid_lines, current_price)
-                line_below = grid_lines[idx-1] if idx > 0 else None
-                line_above = grid_lines[idx] if idx < len(grid_lines) else None
-
                 self._place_bracket_orders(
                     symbol_lower, pos_size, entry_price, current_price,
                     stop_pct, profit_pct, specs["tickSize"], 
@@ -429,7 +426,7 @@ class OctopusGridBot:
             
             if "error" in sl_resp and sl_resp["error"]:
                  bot_log(f"[{symbol.upper()}] SL API Error: {sl_resp['error']}", level="error")
-            time.sleep(0.3)
+            time.sleep(0.4) # Increased from 0.3s
         except Exception as e:
             bot_log(f"[{symbol.upper()}] SL Failed: {e}", level="error")
 
