@@ -39,7 +39,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
 MAX_WORKERS = 2 
-LEVERAGE = 100
+LEVERAGE = 20
 TEST_ASSET_LIMIT = 15
 
 # Strategy Endpoint (The app.py server)
