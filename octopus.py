@@ -39,7 +39,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
 MAX_WORKERS = 2 
-LEVERAGE = 10
+LEVERAGE = 1*15*5
 TEST_ASSET_LIMIT = 15
 
 # Strategy Endpoint (The app.py server)
@@ -293,44 +293,66 @@ class OctopusGridBot:
         if not has_sl or not has_tp:
             self._place_bracket_orders(
                 symbol_lower, pos_size, entry_price, current_price,
-                stop_pct, profit_pct, specs["tickSize"]
+                stop_pct, profit_pct, specs["tickSize"],
+                has_sl, has_tp
             )
 
     def _place_bracket_orders(self, symbol: str, position_size: float, entry_price: float, current_price: float,
-                              sl_pct: float, tp_pct: float, tick_size: float):
+                              sl_pct: float, tp_pct: float, tick_size: float, has_sl: bool, has_tp: bool):
         is_long = position_size > 0
         side = "sell" if is_long else "buy"
         abs_size = abs(position_size)
 
-        if is_long:
-            sl_price = entry_price * (1 - sl_pct)
-            tp_price = entry_price * (1 + tp_pct)
-        else:
-            sl_price = entry_price * (1 + sl_pct)
-            tp_price = entry_price * (1 - tp_pct)
+        # Handle SL Logic (Check & Place)
+        if not has_sl:
+            if is_long:
+                sl_price = entry_price * (1 - sl_pct)
+            else:
+                sl_price = entry_price * (1 + sl_pct)
+            sl_price = self._round_to_step(sl_price, tick_size)
 
-        sl_price = self._round_to_step(sl_price, tick_size)
-        tp_price = self._round_to_step(tp_price, tick_size)
+            # Emergency Check (Only if SL is missing)
+            sl_breached = False
+            if is_long and current_price <= sl_price: sl_breached = True
+            elif not is_long and current_price >= sl_price: sl_breached = True
 
-        bot_log(f"[{symbol.upper()}] PROTECTION MISSING. Placing Brackets | SL: {sl_price} | TP: {tp_price}")
+            if sl_breached:
+                bot_log(f"[{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Market Close.")
+                try:
+                    self.kf.send_order({
+                        "orderType": "mkt", "symbol": symbol, "side": side,
+                        "size": abs_size, "reduceOnly": True
+                    })
+                except Exception as e:
+                     bot_log(f"[{symbol.upper()}] Emergency Close Failed: {e}", level="error")
+                return # Don't place other orders if we are exiting
 
-        # Place SL
-        try:
-            self.kf.send_order({
-                "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
-                "stopPrice": sl_price, "triggerSignal": "mark", "reduceOnly": True
-            })
-        except Exception as e:
-            bot_log(f"[{symbol.upper()}] SL Placement Failed: {e}", level="error")
+            # Place SL
+            bot_log(f"[{symbol.upper()}] SL MISSING. Placing at {sl_price}")
+            try:
+                self.kf.send_order({
+                    "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
+                    "stopPrice": sl_price, "triggerSignal": "mark", "reduceOnly": True
+                })
+            except Exception as e:
+                bot_log(f"[{symbol.upper()}] SL Placement Failed: {e}", level="error")
 
-        # Place TP
-        try:
-            self.kf.send_order({
-                "orderType": "lmt", "symbol": symbol, "side": side, "size": abs_size, 
-                "limitPrice": tp_price, "reduceOnly": True
-            })
-        except Exception as e:
-            bot_log(f"[{symbol.upper()}] TP Placement Failed: {e}", level="error")
+        # Handle TP Logic (Place Only)
+        if not has_tp:
+            if is_long:
+                tp_price = entry_price * (1 + tp_pct)
+            else:
+                tp_price = entry_price * (1 - tp_pct)
+            tp_price = self._round_to_step(tp_price, tick_size)
+
+            bot_log(f"[{symbol.upper()}] TP MISSING. Placing at {tp_price}")
+            try:
+                self.kf.send_order({
+                    "orderType": "lmt", "symbol": symbol, "side": side, "size": abs_size, 
+                    "limitPrice": tp_price, "reduceOnly": True
+                })
+            except Exception as e:
+                bot_log(f"[{symbol.upper()}] TP Placement Failed: {e}", level="error")
 
     # --- Slow Loop Logic (Entries) ---
 
@@ -399,7 +421,7 @@ class OctopusGridBot:
             
             safe_equity = equity * 0.95
             allocation_per_asset = safe_equity / max(1, asset_count)
-            unit_usd = (allocation_per_asset * LEVERAGE)
+            unit_usd = (allocation_per_asset * LEVERAGE) * 0.20 
             
             qty = unit_usd / current_price
             qty = self._round_to_step(qty, specs["sizeStep"])
@@ -460,4 +482,3 @@ if __name__ == "__main__":
     bot = OctopusGridBot()
     bot.initialize()
     bot.run()
-p
