@@ -43,7 +43,7 @@ LEVERAGE = 10
 TEST_ASSET_LIMIT = 15
 
 # Strategy Endpoint (The app.py server)
-STRATEGY_URL = "https://machine-learning.up.railway.app/api/parameters"
+STRATEGY_URL = "https://spear22.up.railway.app/api/parameters"
 
 # Asset Mapping: App Symbol -> Kraken Futures Symbol
 SYMBOL_MAP = {
