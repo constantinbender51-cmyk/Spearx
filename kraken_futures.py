@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
 Kraken-Futures API client.
-1-to-1 translation of the official JS sample.
+Patched for Server-Side Brackets (JSON Support).
 """
 import base64
 import hashlib
 import hmac
 import time
 import urllib.parse
-from typing import Dict, Any, Optional
-
+import json
 import requests
-
+from typing import Dict, Any, Optional
 
 class KrakenFuturesApi:
     def __init__(
@@ -38,6 +37,7 @@ class KrakenFuturesApi:
     def _sign_request(self, endpoint: str, nonce: str, post_data: str = "") -> str:
         # strip '/derivatives' prefix if present
         path = endpoint[12:] if endpoint.startswith("/derivatives") else endpoint
+        # For JSON, post_data is the raw JSON string.
         message = (post_data + nonce + path).encode()
         sha256_hash = hashlib.sha256(message).digest()
         secret_decoded = base64.b64decode(self.api_secret)
@@ -57,21 +57,34 @@ class KrakenFuturesApi:
         headers = {
             "APIKey": self.api_key,
             "Nonce": nonce,
-            "User-Agent": "Kraken-Futures-Py-Client/1.0",
+            "User-Agent": "Kraken-Futures-Py-Client/1.1",
         }
 
+        # PATCH: Use JSON for POST requests to support nested SL/TP objects
         if method.upper() == "POST":
-            post_data = urllib.parse.urlencode(params)
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            # Compact separators are often safer/cleaner for APIs
+            post_data = json.dumps(params, separators=(',', ':'))
+            headers["Content-Type"] = "application/json"
         elif params:
             url += "?" + urllib.parse.urlencode(params)
 
         headers["Authent"] = self._sign_request(endpoint, nonce, post_data)
 
         rsp = requests.request(method, url, headers=headers, data=post_data or None)
-        if not rsp.ok:
-            raise RuntimeError(f"{method} {endpoint} failed : {rsp.text}")
-        return rsp.json()
+        
+        try:
+            data = rsp.json()
+        except ValueError:
+            # Handle non-JSON responses (e.g. 502/504 errors)
+            raise RuntimeError(f"API Error {rsp.status_code}: {rsp.text}")
+
+        if not rsp.ok or "error" in data:
+            # Kraken sometimes returns 200 OK with "result":"error" in body
+            # or 4xx with error details.
+            error_msg = data.get("error", rsp.text)
+            raise RuntimeError(f"{method} {endpoint} failed: {error_msg}")
+            
+        return data
 
     # ------------------------------------------------------------------
     # public endpoints
@@ -137,19 +150,12 @@ class KrakenFuturesApi:
         """Return single order status."""
         return self._request("GET", "/derivatives/api/v3/orders", {"order_id": order_id})
 
-# ------------------------------------------------------------------
-# quick self-test
-# ------------------------------------------------------------------
 if __name__ == "__main__":
     import os
-
-    KEY = os.getenv("KRAKEN_FUTURES_KEY", "YOUR_API_KEY")
-    SEC = os.getenv("KRAKEN_FUTURES_SECRET", "YOUR_API_SECRET")
-
-    api = KrakenFuturesApi(KEY, SEC)
-
-    print("--- public tickers ---")
-    print(api.get_tickers()["tickers"][:2])
-
-    print("\n--- private accounts ---")
-    print(api.get_accounts())
+    # Self-test
+    KEY = os.getenv("KRAKEN_FUTURES_KEY", "")
+    SEC = os.getenv("KRAKEN_FUTURES_SECRET", "")
+    if KEY and SEC:
+        api = KrakenFuturesApi(KEY, SEC)
+        print("--- Testing API Connection ---")
+        print(api.get_accounts())
