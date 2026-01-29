@@ -39,7 +39,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
 MAX_WORKERS = 2 
-LEVERAGE = 10
+LEVERAGE = 100
 TEST_ASSET_LIMIT = 15
 
 # Strategy Endpoint (The app.py server)
@@ -314,22 +314,6 @@ class OctopusGridBot:
 
         bot_log(f"[{symbol.upper()}] PROTECTION MISSING. Placing Brackets | SL: {sl_price} | TP: {tp_price}")
 
-        # Emergency Check
-        sl_breached = False
-        if is_long and current_price <= sl_price: sl_breached = True
-        elif not is_long and current_price >= sl_price: sl_breached = True
-
-        if sl_breached:
-            bot_log(f"[{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Market Close.")
-            try:
-                self.kf.send_order({
-                    "orderType": "mkt", "symbol": symbol, "side": side,
-                    "size": abs_size, "reduceOnly": True
-                })
-            except Exception as e:
-                 bot_log(f"[{symbol.upper()}] Emergency Close Failed: {e}", level="error")
-            return
-
         # Place SL
         try:
             self.kf.send_order({
@@ -476,3 +460,4 @@ if __name__ == "__main__":
     bot = OctopusGridBot()
     bot.initialize()
     bot.run()
+p
