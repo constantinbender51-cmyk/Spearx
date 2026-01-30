@@ -305,62 +305,37 @@ class OctopusGridBot:
 
         # Handle SL Logic (Check & Place)
         if not has_sl:
-            # Determine Trigger Price
             if is_long:
                 sl_price = entry_price * (1 - sl_pct)
             else:
                 sl_price = entry_price * (1 + sl_pct)
-            
-            # Determine Limit Price with Buffer (0.2%)
-            buffer_pct = 0.002
-            if is_long:
-                sl_limit_price = sl_price * (1 - buffer_pct)
-            else:
-                sl_limit_price = sl_price * (1 + buffer_pct)
-
             sl_price = self._round_to_step(sl_price, tick_size)
-            sl_limit_price = self._round_to_step(sl_limit_price, tick_size)
 
-            # Place SL with Fallback
-            bot_log(f"[{symbol.upper()}] SL MISSING. Placing at {sl_price} (Limit: {sl_limit_price})")
-            
-            fallback_triggered = False
-            try:
-                # Capture the response
-                resp = self.kf.send_order({
-                    "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
-                    "stopPrice": sl_price, "limitPrice": sl_limit_price, "triggerSignal": "mark", "reduceOnly": True
-                })
+            # Emergency Check (Only if SL is missing)
+            sl_breached = False
+            if is_long and current_price <= sl_price: sl_breached = True
+            elif not is_long and current_price >= sl_price: sl_breached = True
 
-                # Check for explicit rejection in response payload
-                # The document shows status is nested in 'sendStatus'
-                if isinstance(resp, dict):
-                    if "error" in resp:
-                        bot_log(f"[{symbol.upper()}] SL API Error: {resp['error']}", level="error")
-                        fallback_triggered = True
-                    elif "sendStatus" in resp:
-                        [span_4](start_span)[span_5](start_span)# Status must be 'placed' to be successful
-                        #[span_4](end_span)[span_5](end_span) Other values indicate specific failures (insufficientFunds, etc.)
-                        status = resp["sendStatus"].get("status")
-                        if status not in ["placed", "filled"]:
-                            bot_log(f"[{symbol.upper()}] SL REJECTED: {status}", level="error")
-                            fallback_triggered = True
-            
-            except Exception as e:
-                bot_log(f"[{symbol.upper()}] SL Placement Exception: {e}", level="error")
-                fallback_triggered = True
-
-            # Fallback: Market Order
-            if fallback_triggered:
-                bot_log(f"[{symbol.upper()}] ATTEMPTING MARKET CLOSE.", level="warning")
+            if sl_breached:
+                bot_log(f"[{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Market Close.")
                 try:
                     self.kf.send_order({
-                        "orderType": "mkt", "symbol": symbol, "side": side, 
+                        "orderType": "mkt", "symbol": symbol, "side": side,
                         "size": abs_size, "reduceOnly": True
                     })
-                    bot_log(f"[{symbol.upper()}] Fallback Market Close Sent.", level="warning")
-                except Exception as e2:
-                    bot_log(f"[{symbol.upper()}] Fallback Market Close Failed: {e2}", level="error")
+                except Exception as e:
+                     bot_log(f"[{symbol.upper()}] Emergency Close Failed: {e}", level="error")
+                return # Don't place other orders if we are exiting
+
+            # Place SL
+            bot_log(f"[{symbol.upper()}] SL MISSING. Placing at {sl_price}")
+            try:
+                self.kf.send_order({
+                    "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
+                    "stopPrice": sl_price, "triggerSignal": "mark", "reduceOnly": True
+                })
+            except Exception as e:
+                bot_log(f"[{symbol.upper()}] SL Placement Failed: {e}", level="error")
 
         # Handle TP Logic (Place Only)
         if not has_tp:
