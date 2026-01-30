@@ -253,7 +253,7 @@ class OctopusGridBot:
         specs = self.instrument_specs.get(symbol_upper)
         if not specs: return
 
-        has_sl = False
+        has_sl = True 
         has_tp = False
         stale_entry_ids = []
 
