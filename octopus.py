@@ -332,7 +332,7 @@ class OctopusGridBot:
             try:
                 self.kf.send_order({
                     "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
-                    "stopPrice": sl_price, "triggerSignal": "mark", "reduceOnly": True
+                    "stopPrice": sl_price, "limitPrice": sl_price, "triggerSignal": "mark", "reduceOnly": True
                 })
             except Exception as e:
                 bot_log(f"[{symbol.upper()}] SL Placement Failed: {e}", level="error")
