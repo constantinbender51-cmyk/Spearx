@@ -197,9 +197,6 @@ class OctopusGridBot:
         try:
             raw_pos = self.kf.get_open_positions()
             raw_ord = self.kf.get_open_orders()
-            # DEBUG: Print raw order response to identify type mismatch
-            print(f"DEBUG_RAW_ORDERS: {raw_ord}")
-            
             raw_tick = self.kf.get_tickers()
         except Exception as e:
             bot_log(f"Monitor Fetch Error: {e}", level="error")
