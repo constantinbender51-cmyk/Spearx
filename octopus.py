@@ -323,14 +323,35 @@ class OctopusGridBot:
 
             # Place SL with Fallback
             bot_log(f"[{symbol.upper()}] SL MISSING. Placing at {sl_price} (Limit: {sl_limit_price})")
+            
+            fallback_triggered = False
             try:
-                self.kf.send_order({
+                # Capture the response
+                resp = self.kf.send_order({
                     "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
                     "stopPrice": sl_price, "limitPrice": sl_limit_price, "triggerSignal": "mark", "reduceOnly": True
                 })
+
+                # Check for explicit rejection in response payload
+                # Standard Kraken Futures response for success: {'sendStatus': {'status': 'placed', ...}}
+                # Error response often contains 'error' or status 'rejected'
+                if isinstance(resp, dict):
+                    if "error" in resp:
+                        bot_log(f"[{symbol.upper()}] SL API Error: {resp['error']}", level="error")
+                        fallback_triggered = True
+                    elif "sendStatus" in resp:
+                        status = resp["sendStatus"].get("status")
+                        if status == "rejected":
+                            bot_log(f"[{symbol.upper()}] SL REJECTED by API.", level="error")
+                            fallback_triggered = True
+            
             except Exception as e:
-                bot_log(f"[{symbol.upper()}] SL Placement Failed: {e}. ATTEMPTING MARKET CLOSE.", level="error")
-                # Fallback: Market Order
+                bot_log(f"[{symbol.upper()}] SL Placement Exception: {e}", level="error")
+                fallback_triggered = True
+
+            # Fallback: Market Order
+            if fallback_triggered:
+                bot_log(f"[{symbol.upper()}] ATTEMPTING MARKET CLOSE.", level="warning")
                 try:
                     self.kf.send_order({
                         "orderType": "mkt", "symbol": symbol, "side": side, 
