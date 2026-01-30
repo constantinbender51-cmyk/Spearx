@@ -253,7 +253,7 @@ class OctopusGridBot:
         specs = self.instrument_specs.get(symbol_upper)
         if not specs: return
 
-        has_sl = True 
+        has_sl = False
         has_tp = False
         stale_entry_ids = []
 
@@ -310,22 +310,6 @@ class OctopusGridBot:
             else:
                 sl_price = entry_price * (1 + sl_pct)
             sl_price = self._round_to_step(sl_price, tick_size)
-
-            # Emergency Check (Only if SL is missing)
-            sl_breached = False
-            if is_long and current_price <= sl_price: sl_breached = True
-            elif not is_long and current_price >= sl_price: sl_breached = True
-
-            if sl_breached:
-                bot_log(f"[{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Market Close.")
-                try:
-                    self.kf.send_order({
-                        "orderType": "mkt", "symbol": symbol, "side": side,
-                        "size": abs_size, "reduceOnly": True
-                    })
-                except Exception as e:
-                     bot_log(f"[{symbol.upper()}] Emergency Close Failed: {e}", level="error")
-                return # Don't place other orders if we are exiting
 
             # Place SL
             bot_log(f"[{symbol.upper()}] SL MISSING. Placing at {sl_price}")
