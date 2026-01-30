@@ -319,7 +319,7 @@ class OctopusGridBot:
             if sl_breached:
                 bot_log(f"[{symbol.upper()}] EMERGENCY: Price {current_price} crossed SL {sl_price}. Market Close.")
                 try:
-                    self.kf.send_order({
+                    #self.kf.send_order({
                         "orderType": "mkt", "symbol": symbol, "side": side,
                         "size": abs_size, "reduceOnly": True
                     })
