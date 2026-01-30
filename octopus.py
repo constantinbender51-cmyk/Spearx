@@ -305,21 +305,40 @@ class OctopusGridBot:
 
         # Handle SL Logic (Check & Place)
         if not has_sl:
+            # Determine Trigger Price
             if is_long:
                 sl_price = entry_price * (1 - sl_pct)
             else:
                 sl_price = entry_price * (1 + sl_pct)
-            sl_price = self._round_to_step(sl_price, tick_size)
+            
+            # Determine Limit Price with Buffer (0.2%)
+            buffer_pct = 0.002
+            if is_long:
+                sl_limit_price = sl_price * (1 - buffer_pct)
+            else:
+                sl_limit_price = sl_price * (1 + buffer_pct)
 
-            # Place SL
-            bot_log(f"[{symbol.upper()}] SL MISSING. Placing at {sl_price}")
+            sl_price = self._round_to_step(sl_price, tick_size)
+            sl_limit_price = self._round_to_step(sl_limit_price, tick_size)
+
+            # Place SL with Fallback
+            bot_log(f"[{symbol.upper()}] SL MISSING. Placing at {sl_price} (Limit: {sl_limit_price})")
             try:
                 self.kf.send_order({
                     "orderType": "stp", "symbol": symbol, "side": side, "size": abs_size, 
-                    "stopPrice": sl_price, "limitPrice": sl_price, "triggerSignal": "mark", "reduceOnly": True
+                    "stopPrice": sl_price, "limitPrice": sl_limit_price, "triggerSignal": "mark", "reduceOnly": True
                 })
             except Exception as e:
-                bot_log(f"[{symbol.upper()}] SL Placement Failed: {e}", level="error")
+                bot_log(f"[{symbol.upper()}] SL Placement Failed: {e}. ATTEMPTING MARKET CLOSE.", level="error")
+                # Fallback: Market Order
+                try:
+                    self.kf.send_order({
+                        "orderType": "mkt", "symbol": symbol, "side": side, 
+                        "size": abs_size, "reduceOnly": True
+                    })
+                    bot_log(f"[{symbol.upper()}] Fallback Market Close Sent.", level="warning")
+                except Exception as e2:
+                    bot_log(f"[{symbol.upper()}] Fallback Market Close Failed: {e2}", level="error")
 
         # Handle TP Logic (Place Only)
         if not has_tp:
