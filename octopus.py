@@ -333,16 +333,17 @@ class OctopusGridBot:
                 })
 
                 # Check for explicit rejection in response payload
-                # Standard Kraken Futures response for success: {'sendStatus': {'status': 'placed', ...}}
-                # Error response often contains 'error' or status 'rejected'
+                # The document shows status is nested in 'sendStatus'
                 if isinstance(resp, dict):
                     if "error" in resp:
                         bot_log(f"[{symbol.upper()}] SL API Error: {resp['error']}", level="error")
                         fallback_triggered = True
                     elif "sendStatus" in resp:
+                        [span_4](start_span)[span_5](start_span)# Status must be 'placed' to be successful
+                        #[span_4](end_span)[span_5](end_span) Other values indicate specific failures (insufficientFunds, etc.)
                         status = resp["sendStatus"].get("status")
-                        if status == "rejected":
-                            bot_log(f"[{symbol.upper()}] SL REJECTED by API.", level="error")
+                        if status not in ["placed", "filled"]:
+                            bot_log(f"[{symbol.upper()}] SL REJECTED: {status}", level="error")
                             fallback_triggered = True
             
             except Exception as e:
