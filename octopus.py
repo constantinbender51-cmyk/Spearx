@@ -4,8 +4,9 @@ Octopus Trend: Execution Engine for ETH Trend Strategy
 - Logic: Long ETH if BTC Price > 365-period BTC SMA, else Short ETH.
 - Source: Binance (BTCUSDT) for OHLC/SMA.
 - Execution: Kraken Futures (ETHUSD).
-- Interval: 1 Hour
+- Interval: 5 Minutes
 - Sizing: 1x Margin Equity
+- Filter: Updates only if position delta > 10%
 """
 
 import os
@@ -38,7 +39,7 @@ TRADE_SYMBOL = "PF_ETHUSD"
 SIGNAL_SYMBOL = "BTCUSDT"    # Binance Symbol
 SMA_PERIOD = 365             # 365 hours
 LEVERAGE = 1.0               # 1x Equity
-UPDATE_INTERVAL = 3600       # 1 Hour
+UPDATE_INTERVAL = 300        # 5 Minutes
 
 # Logging
 logging.basicConfig(
@@ -56,13 +57,11 @@ class OctopusTrendBot:
     def initialize(self):
         logger.info("--- Initializing Octopus Trend Bot (Binance Data Source) ---")
         try:
-            # Check connection
             acc = self.kf.get_accounts()
             if "error" in acc:
                 logger.error(f"API Error: {acc}")
                 sys.exit(1)
             
-            # Fetch specs for precision
             self._fetch_specs()
             
         except Exception as e:
@@ -84,13 +83,7 @@ class OctopusTrendBot:
             logger.warning(f"Spec fetch failed, using defaults: {e}")
 
     def get_btc_sma_state(self):
-        """
-        Fetches BTC 1h candles from Binance, calculates 365 SMA.
-        Returns: (btc_price, sma_value, is_bullish)
-        """
         try:
-            # Binance API v3 Klines
-            # Limit 500 covers the 365 period requirement safely
             url = "https://api.binance.com/api/v3/klines"
             params = {
                 "symbol": SIGNAL_SYMBOL,
@@ -100,23 +93,17 @@ class OctopusTrendBot:
             resp = requests.get(url, params=params, timeout=10)
             data = resp.json()
             
-            # Check for API errors (Binance returns dict on error, list on success)
             if isinstance(data, dict) and "code" in data:
                 logger.error(f"Binance API Error: {data}")
                 return None, None, None
 
-            # Binance returns: [Open Time, Open, High, Low, Close, Volume, ...]
-            # We need Close (index 4). Data is returned oldest first.
+            # Index 4 is Close
             closes = np.array([float(candle[4]) for candle in data])
 
             if len(closes) < SMA_PERIOD:
                 logger.warning(f"Insufficient Data: {len(closes)}/{SMA_PERIOD}")
                 return None, None, None
 
-            # Calculate SMA on the most recent 365 closed candles
-            # Note: Binance last candle is open (incomplete). 
-            # Strategy: Use last 365 closes including the current potentially incomplete one 
-            # or strictly closed ones. Standard practice for "current state" is to include latest.
             sma = np.mean(closes[-SMA_PERIOD:])
             current_price = closes[-1]
 
@@ -132,7 +119,6 @@ class OctopusTrendBot:
             acc = self.kf.get_accounts()
             if "flex" in acc.get("accounts", {}):
                 return float(acc["accounts"]["flex"].get("marginEquity", 0))
-            # Fallback for single collateral
             first = list(acc.get("accounts", {}).values())[0]
             return float(first.get("marginEquity", 0))
         except Exception:
@@ -154,7 +140,7 @@ class OctopusTrendBot:
         return round(steps) * self.min_size
 
     def run(self):
-        logger.info(f"Bot Running. Cycle: {UPDATE_INTERVAL}s. Target: {TRADE_SYMBOL}")
+        logger.info(f"Bot Running. Cycle: {UPDATE_INTERVAL}s. Filter: >10% Delta.")
         
         while True:
             try:
@@ -165,7 +151,7 @@ class OctopusTrendBot:
                     time.sleep(60)
                     continue
 
-                # 2. Strategy Logic (Binance Data)
+                # 2. Strategy Logic (Binance)
                 btc_price, sma, bull = self.get_btc_sma_state()
                 if btc_price is None:
                     time.sleep(60)
@@ -173,7 +159,7 @@ class OctopusTrendBot:
 
                 logger.info(f"State | BTC: {btc_price:.2f} | SMA({SMA_PERIOD}): {sma:.2f} | Bias: {'LONG' if bull else 'SHORT'}")
 
-                # 3. Sizing (Kraken Execution)
+                # 3. Sizing
                 eth_tickers = self.kf.get_tickers()
                 eth_price = 0.0
                 for t in eth_tickers.get("tickers", []):
@@ -185,7 +171,6 @@ class OctopusTrendBot:
                     logger.error("ETH Price unavailable.")
                     continue
 
-                # Target Notional = Equity * 1.0
                 target_value = equity * LEVERAGE
                 target_qty = target_value / eth_price
                 
@@ -193,24 +178,42 @@ class OctopusTrendBot:
                     target_qty = -target_qty
 
                 target_qty = self._round_size(target_qty)
-
-                # 4. Execution
                 current_qty = self.get_current_position()
-                diff = target_qty - current_qty
+
+                # 4. Filter Logic (10% Threshold)
+                should_trade = False
                 
-                # Check if change is significant (reduce churn)
-                if abs(diff) < self.min_size:
-                    logger.info("Position aligned. No trade.")
+                if abs(current_qty) == 0:
+                    # If flat, trade if target exists
+                    should_trade = abs(target_qty) >= self.min_size
+                elif abs(target_qty) < self.min_size:
+                    # If target is 0 (exit), always trade if currently open
+                    should_trade = abs(current_qty) >= self.min_size
                 else:
-                    side = "buy" if diff > 0 else "sell"
-                    logger.info(f"Rebalance | Curr: {current_qty} -> Targ: {target_qty} | Exec: {side} {abs(diff):.4f}")
+                    # Calculate delta percentage relative to current size
+                    delta = abs(target_qty - current_qty)
+                    pct_change = delta / abs(current_qty)
                     
-                    self.kf.send_order({
-                        "orderType": "mkt",
-                        "symbol": TRADE_SYMBOL.lower(),
-                        "side": side,
-                        "size": abs(diff)
-                    })
+                    if pct_change > 0.10:
+                        should_trade = True
+                    else:
+                        logger.info(f"Delta {pct_change*100:.2f}% < 10%. Holding.")
+
+                # 5. Execution
+                if should_trade:
+                    diff = target_qty - current_qty
+                    if abs(diff) >= self.min_size:
+                        side = "buy" if diff > 0 else "sell"
+                        logger.info(f"EXECUTE | Curr: {current_qty} -> Targ: {target_qty} | Side: {side} {abs(diff):.4f}")
+                        
+                        self.kf.send_order({
+                            "orderType": "mkt",
+                            "symbol": TRADE_SYMBOL.lower(),
+                            "side": side,
+                            "size": abs(diff)
+                        })
+                    else:
+                        logger.info("Diff below min_size. Skipping.")
 
             except Exception as e:
                 logger.error(f"Loop Error: {e}")
