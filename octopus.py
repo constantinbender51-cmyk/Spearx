@@ -2,6 +2,8 @@
 """
 Octopus Trend: Execution Engine for ETH Trend Strategy
 - Logic: Long ETH if BTC Price > 365-period BTC SMA, else Short ETH.
+- Source: Binance (BTCUSDT) for OHLC/SMA.
+- Execution: Kraken Futures (ETHUSD).
 - Interval: 1 Hour
 - Sizing: 1x Margin Equity
 """
@@ -32,8 +34,8 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Strategy Settings
-TRADE_SYMBOL = "FF_XRPUSD_270226"
-SIGNAL_SYMBOL = "PF_XBTUSD"  # BTC
+TRADE_SYMBOL = "PF_ETHUSD"
+SIGNAL_SYMBOL = "BTCUSDT"    # Binance Symbol
 SMA_PERIOD = 365             # 365 hours
 LEVERAGE = 1.0               # 1x Equity
 UPDATE_INTERVAL = 3600       # 1 Hour
@@ -50,10 +52,9 @@ class OctopusTrendBot:
     def __init__(self):
         self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
         self.min_size = 0.01
-        self.tick_size = 0.01
 
     def initialize(self):
-        logger.info("--- Initializing Octopus Trend Bot ---")
+        logger.info("--- Initializing Octopus Trend Bot (Binance Data Source) ---")
         try:
             # Check connection
             acc = self.kf.get_accounts()
@@ -84,35 +85,40 @@ class OctopusTrendBot:
 
     def get_btc_sma_state(self):
         """
-        Fetches BTC 1h candles, calculates 365 SMA.
+        Fetches BTC 1h candles from Binance, calculates 365 SMA.
         Returns: (btc_price, sma_value, is_bullish)
         """
         try:
-            # v3 candles: resolution 1h
-            url = f"https://futures.kraken.com/derivatives/api/v3/candles?symbol={SIGNAL_SYMBOL}&candleType=trade&resolution=1h"
-            resp = requests.get(url, timeout=10).json()
+            # Binance API v3 Klines
+            # Limit 500 covers the 365 period requirement safely
+            url = "https://api.binance.com/api/v3/klines"
+            params = {
+                "symbol": SIGNAL_SYMBOL,
+                "interval": "1h",
+                "limit": 500
+            }
+            resp = requests.get(url, params=params, timeout=10)
+            data = resp.json()
             
-            if "candles" not in resp:
-                logger.error("No candle data returned.")
+            # Check for API errors (Binance returns dict on error, list on success)
+            if isinstance(data, dict) and "code" in data:
+                logger.error(f"Binance API Error: {data}")
                 return None, None, None
 
-            # Sort by time asc
-            candles = sorted(resp["candles"], key=lambda x: x["time"])
-            closes = np.array([float(c["close"]) for c in candles])
+            # Binance returns: [Open Time, Open, High, Low, Close, Volume, ...]
+            # We need Close (index 4). Data is returned oldest first.
+            closes = np.array([float(candle[4]) for candle in data])
 
             if len(closes) < SMA_PERIOD:
                 logger.warning(f"Insufficient Data: {len(closes)}/{SMA_PERIOD}")
                 return None, None, None
 
+            # Calculate SMA on the most recent 365 closed candles
+            # Note: Binance last candle is open (incomplete). 
+            # Strategy: Use last 365 closes including the current potentially incomplete one 
+            # or strictly closed ones. Standard practice for "current state" is to include latest.
             sma = np.mean(closes[-SMA_PERIOD:])
             current_price = closes[-1]
-            
-            # Check live price for most recent data point
-            tickers = self.kf.get_tickers()
-            for t in tickers.get("tickers", []):
-                if t["symbol"].upper() == SIGNAL_SYMBOL:
-                    current_price = float(t["markPrice"])
-                    break
 
             is_bullish = current_price > sma
             return current_price, sma, is_bullish
@@ -159,7 +165,7 @@ class OctopusTrendBot:
                     time.sleep(60)
                     continue
 
-                # 2. Strategy Logic
+                # 2. Strategy Logic (Binance Data)
                 btc_price, sma, bull = self.get_btc_sma_state()
                 if btc_price is None:
                     time.sleep(60)
@@ -167,7 +173,7 @@ class OctopusTrendBot:
 
                 logger.info(f"State | BTC: {btc_price:.2f} | SMA({SMA_PERIOD}): {sma:.2f} | Bias: {'LONG' if bull else 'SHORT'}")
 
-                # 3. Sizing
+                # 3. Sizing (Kraken Execution)
                 eth_tickers = self.kf.get_tickers()
                 eth_price = 0.0
                 for t in eth_tickers.get("tickers", []):
