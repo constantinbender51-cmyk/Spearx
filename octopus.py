@@ -35,7 +35,7 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Strategy Settings
-TRADE_SYMBOL = "FF_ETHUSD_270226"
+TRADE_SYMBOL = "FF_ETHUSD_260626"
 SIGNAL_SYMBOL = "BTCUSDT"    # Binance Symbol
 SMA_PERIOD = 365             # 365 hours
 LEVERAGE = 5        # 1x Equity
