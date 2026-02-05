@@ -38,7 +38,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 TRADE_SYMBOL = "FF_XRPUSD_270226"
 SIGNAL_SYMBOL = "BTCUSDT"    # Binance Symbol
 SMA_PERIOD = 365             # 365 hours
-LEVERAGE = 1.0               # 1x Equity
+LEVERAGE = 5        # 1x Equity
 UPDATE_INTERVAL = 300        # 5 Minutes
 
 # Logging
