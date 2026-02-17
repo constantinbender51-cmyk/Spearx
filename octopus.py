@@ -3,7 +3,9 @@
 Kraken Futures Copy Bot
 1. Monitors BTC Perpetual position (Source).
 2. Maintains equal Notional Value (USD) in PEPE and XRP Perps (Targets).
-3. Rebalances only if the required position size deviates > 10% from actual.
+3. Logic:
+   - If NO open order: Check if position deviates > 10%. If so, place Limit Order.
+   - If OPEN order exists: Update (Edit) it to trail the current Mark Price.
 4. Checks once per minute.
 """
 
@@ -12,7 +14,7 @@ import sys
 import time
 import logging
 import json
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 # --- Local Imports ---
 try:
@@ -31,15 +33,14 @@ except ImportError:
 KEY = os.getenv("KRAKEN_FUTURES_KEY")
 SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
-# Symbols (Must be correct Kraken Futures identifiers)
+# Symbols
 SOURCE_SYMBOL = "PF_XBTUSD"
 TARGET_SYMBOLS = ["PF_PEPEUSD", "PF_XRPUSD"]
 
-# Threshold (10%)
-REBALANCE_THRESHOLD = 0.10
-
-# Slippage for Limit Orders (mimic market order)
-SLIPPAGE = 0.02
+# Settings
+REBALANCE_THRESHOLD = 0.10  # 10% deviation trigger
+LIMIT_OFFSET = 0.002        # 0.2% "Taker" offset (ensures fill). 
+                            # Set to -0.001 for "Maker" (passive) behavior.
 
 # Logging Setup
 logging.basicConfig(
@@ -56,10 +57,9 @@ class CopyBot:
             sys.exit(1)
             
         self.kf = KrakenFuturesApi(KEY, SECRET)
-        self.specs = {} # Stores lot sizes and precisions
+        self.specs = {} 
 
     def initialize(self):
-        """Fetch instrument specs to ensure we send valid order sizes."""
         logger.info("Fetching instrument specifications...")
         try:
             resp = self.kf.get_instruments()
@@ -79,151 +79,164 @@ class CopyBot:
             sys.exit(1)
 
     def _round_to_lot(self, symbol: str, quantity: float) -> float:
-        """Rounds a quantity to the nearest valid lot size."""
         symbol = symbol.upper()
-        if symbol not in self.specs:
-            return quantity
+        if symbol not in self.specs: return quantity
         lot_size = self.specs[symbol]["lotSize"]
         if lot_size == 0: return quantity
         return round(quantity / lot_size) * lot_size
 
     def _round_to_tick(self, symbol: str, price: float) -> float:
-        """Rounds a price to the nearest valid tick size."""
         symbol = symbol.upper()
-        if symbol not in self.specs:
-            return price
+        if symbol not in self.specs: return price
         tick_size = self.specs[symbol]["tickSize"]
         if tick_size == 0: return price
         return round(price / tick_size) * tick_size
 
-    def get_market_data(self):
-        """Fetches current positions and market prices."""
+    def get_data(self):
+        """Fetches Positions, Prices, and Open Orders."""
         try:
-            # 1. Get Positions
             pos_resp = self.kf.get_open_positions()
             positions = {}
             if "openPositions" in pos_resp:
                 for p in pos_resp["openPositions"]:
                     s = float(p["size"])
-                    if p["side"] == "short":
-                        s = -s
+                    if p["side"] == "short": s = -s
                     positions[p["symbol"].upper()] = s
             
-            # 2. Get Prices
             tick_resp = self.kf.get_tickers()
             prices = {}
             if "tickers" in tick_resp:
                 for t in tick_resp["tickers"]:
                     prices[t["symbol"].upper()] = float(t["markPrice"])
-            
-            return positions, prices
+
+            ord_resp = self.kf.get_open_orders()
+            open_orders = {} # Map Symbol -> Order Object
+            if "openOrders" in ord_resp:
+                for o in ord_resp["openOrders"]:
+                    sym = o["symbol"].upper()
+                    # We only care about one order per symbol for this simple bot
+                    open_orders[sym] = o 
+
+            return positions, prices, open_orders
         except Exception as e:
             logger.error(f"API Error fetching data: {e}")
-            return {}, {}
+            return {}, {}, {}
 
     def run(self):
         logger.info(f"--- Bot Started ---")
-        logger.info(f"Source: {SOURCE_SYMBOL} | Targets: {TARGET_SYMBOLS}")
-        logger.info(f"Update Interval: 60s | Threshold: {REBALANCE_THRESHOLD*100}%")
+        logger.info(f"Source: {SOURCE_SYMBOL} | Limit Offset: {LIMIT_OFFSET*100}%")
 
         while True:
             try:
-                positions, prices = self.get_market_data()
+                positions, prices, open_orders = self.get_data()
 
-                # --- 1. Analyze Source (BTC) ---
                 if SOURCE_SYMBOL not in prices:
-                    logger.warning(f"Price for {SOURCE_SYMBOL} not found. Skipping cycle.")
+                    logger.warning(f"Price for {SOURCE_SYMBOL} not found. Skipping.")
                     time.sleep(10)
                     continue
 
+                # 1. Calculate Source Value
                 btc_size = positions.get(SOURCE_SYMBOL, 0.0)
                 btc_price = prices[SOURCE_SYMBOL]
                 btc_value_usd = btc_size * btc_price
 
                 logger.info(f"Source {SOURCE_SYMBOL}: Size {btc_size:.4f} | Value ${btc_value_usd:.2f}")
 
-                # --- 2. Check Targets ---
-                orders_to_send = []
+                batch_instructions = []
 
+                # 2. Process Targets
                 for target_sym in TARGET_SYMBOLS:
                     if target_sym not in prices:
-                        logger.warning(f"Price for {target_sym} not found. Skipping.")
                         continue
 
                     target_price = prices[target_sym]
                     current_qty = positions.get(target_sym, 0.0)
+                    existing_order = open_orders.get(target_sym)
 
-                    # Calculate Desired Quantity
+                    # Calculate Targets
                     desired_value_usd = btc_value_usd 
                     raw_target_qty = desired_value_usd / target_price
                     target_qty = self._round_to_lot(target_sym, raw_target_qty)
 
-                    # --- 3. Deviation Logic ---
-                    should_trade = False
+                    # Determine Delta
+                    diff = target_qty - current_qty
+                    abs_diff = abs(diff)
+                    final_size = self._round_to_lot(target_sym, abs_diff)
                     
-                    if current_qty == 0 and abs(target_qty) > 0:
-                        should_trade = True
-                    elif current_qty != 0 and target_qty == 0:
-                        should_trade = True
-                    elif current_qty != 0:
-                        diff = target_qty - current_qty
-                        pct_deviation = abs(diff) / abs(current_qty)
-                        if pct_deviation > REBALANCE_THRESHOLD:
-                            should_trade = True
+                    # Determine Side
+                    side = "buy" if diff > 0 else "sell"
 
-                    # --- 4. Prepare Order ---
-                    if should_trade:
-                        trade_size = target_qty - current_qty
-                        side = "buy" if trade_size > 0 else "sell"
+                    # Calculate Safe Limit Price (Trailing)
+                    # Buy = Mark * (1 + offset), Sell = Mark * (1 - offset)
+                    if side == "buy":
+                        raw_price = target_price * (1 + LIMIT_OFFSET)
+                    else:
+                        raw_price = target_price * (1 - LIMIT_OFFSET)
+                    
+                    limit_price = self._round_to_tick(target_sym, raw_price)
+
+                    # --- Logic Branch ---
+                    
+                    # CASE A: Open Order Exists -> EDIT (Trail Price)
+                    if existing_order:
+                        order_id = existing_order.get("order_id") or existing_order.get("orderId")
                         
-                        abs_size = abs(trade_size)
-                        abs_size = self._round_to_lot(target_sym, abs_size)
+                        # Only edit if size or price is significantly different to avoid API spam
+                        # But here we just send the edit to ensure tight trailing
+                        logger.info(f"EDIT {target_sym}: Trailing to {limit_price} (Size: {final_size})")
+                        
+                        batch_instructions.append({
+                            "order": "edit",
+                            "orderId": order_id,
+                            "symbol": target_sym.lower(),
+                            "limitPrice": str(limit_price),
+                            "size": str(final_size)
+                        })
 
-                        if abs_size > 0:
-                            # Calculate LIMIT PRICE (Market-like)
-                            # Buy: Price + 2%, Sell: Price - 2%
-                            if side == "buy":
-                                raw_price = target_price * (1 + SLIPPAGE)
-                            else:
-                                raw_price = target_price * (1 - SLIPPAGE)
-                            
-                            limit_price = self._round_to_tick(target_sym, raw_price)
+                    # CASE B: No Open Order -> Check Threshold -> SEND
+                    else:
+                        should_trade = False
+                        # 0 -> Something
+                        if current_qty == 0 and abs(target_qty) > 0:
+                            should_trade = True
+                        # Something -> 0
+                        elif current_qty != 0 and target_qty == 0:
+                            should_trade = True
+                        # Something -> Something (Deviation)
+                        elif current_qty != 0:
+                            pct_deviation = abs_diff / abs(current_qty)
+                            if pct_deviation > REBALANCE_THRESHOLD:
+                                should_trade = True
 
-                            logger.info(f"REBALANCE {target_sym}: Curr {current_qty} -> Targ {target_qty} | {side.upper()} {abs_size} @ {limit_price}")
-                            
-                            orders_to_send.append({
+                        if should_trade and final_size > 0:
+                            logger.info(f"NEW ORDER {target_sym}: Delta {final_size} | {side.upper()} @ {limit_price}")
+                            batch_instructions.append({
                                 "order": "send",
                                 "order_tag": "copy_bot",
-                                "orderType": "lmt",          # <--- CHANGED to LIMIT
+                                "orderType": "lmt",
                                 "symbol": target_sym.lower(),
                                 "side": side,
-                                "size": str(abs_size),       # Send as string
-                                "limitPrice": str(limit_price), # Send as string
+                                "size": str(final_size),
+                                "limitPrice": str(limit_price),
                                 "cliOrdId": f"cb_{int(time.time()*1000)}_{target_sym[-3:]}"
                             })
 
-                # --- 5. Execute Batch ---
-                if orders_to_send:
-                    logger.info(f"Sending {len(orders_to_send)} orders...")
-                    
-                    wrapper = {"batchOrder": orders_to_send}
+                # 3. Execute Batch
+                if batch_instructions:
+                    logger.info(f"Sending {len(batch_instructions)} instructions...")
+                    wrapper = {"batchOrder": batch_instructions}
                     payload = {"json": json.dumps(wrapper)}
                     
                     resp = self.kf.batch_order(payload)
                     
                     if "batchStatus" in resp:
-                         statuses = resp.get("batchStatus", [])
-                         for i, res in enumerate(statuses):
-                             if "orderId" in res:
-                                 logger.info(f"Order {i+1} OK: {res['orderId']}")
-                             elif "order_id" in res:
-                                 logger.info(f"Order {i+1} OK: {res['order_id']}")
-                             else:
-                                 logger.error(f"Order {i+1} Failed: {res}")
+                        for i, res in enumerate(resp["batchStatus"]):
+                            status = res.get("status")
+                            logger.info(f"Instruction {i+1}: {status}")
                     else:
                         logger.error(f"Batch failed: {resp}")
                 else:
-                    logger.info("No rebalance needed.")
+                    logger.info("No updates needed.")
 
             except Exception as e:
                 logger.error(f"Loop Exception: {e}")
