@@ -11,7 +11,7 @@ import os
 import sys
 import time
 import logging
-import json
+import jsonit
 from typing import Dict, Any
 
 # --- Local Imports ---
@@ -82,7 +82,6 @@ class CopyBot:
             return quantity
         
         lot_size = self.specs[symbol]["lotSize"]
-        # Avoid division by zero
         if lot_size == 0: return quantity
         
         # Round to nearest lot
@@ -148,7 +147,7 @@ class CopyBot:
                     target_price = prices[target_sym]
                     current_qty = positions.get(target_sym, 0.0)
 
-                    # Calculate Desired Quantity (Target Value == BTC Value)
+                    # Calculate Desired Quantity
                     desired_value_usd = btc_value_usd 
                     raw_target_qty = desired_value_usd / target_price
                     
@@ -158,66 +157,55 @@ class CopyBot:
                     # --- 3. Deviation Logic ---
                     should_trade = False
                     
-                    # Scenario A: We have 0, but want some
                     if current_qty == 0 and abs(target_qty) > 0:
                         should_trade = True
-                    
-                    # Scenario B: We have some, but want 0
                     elif current_qty != 0 and target_qty == 0:
                         should_trade = True
-                        
-                    # Scenario C: Deviation check
                     elif current_qty != 0:
                         diff = target_qty - current_qty
                         pct_deviation = abs(diff) / abs(current_qty)
                         if pct_deviation > REBALANCE_THRESHOLD:
                             should_trade = True
-                        else:
-                            pass 
 
                     # --- 4. Prepare Order ---
                     if should_trade:
-                        # Calculate trade size (delta)
                         trade_size = target_qty - current_qty
                         side = "buy" if trade_size > 0 else "sell"
                         
                         abs_size = abs(trade_size)
-                        # Re-round the delta to be safe
                         abs_size = self._round_to_lot(target_sym, abs_size)
 
                         if abs_size > 0:
                             logger.info(f"REBALANCE {target_sym}: Curr {current_qty} -> Targ {target_qty} | Delta: {side.upper()} {abs_size}")
                             
+                            # --- FIXED: Added 'order' and 'order_tag' ---
                             orders_to_send.append({
+                                "order": "send",             # <--- REQUIRED: Specifies action type
+                                "order_tag": "copy_bot",     # <--- REQUIRED: Arbitrary tag
                                 "orderType": "mkt",
                                 "symbol": target_sym.lower(), 
                                 "side": side,
-                                "size": abs_size
+                                "size": abs_size,
+                                "cliOrdId": f"cb_{int(time.time()*1000)}_{target_sym[-3:]}"
                             })
 
                 # --- 5. Execute Batch ---
                 if orders_to_send:
                     logger.info(f"Sending {len(orders_to_send)} orders...")
                     
-                    # --- CRITICAL FIX ---
-                    # The API expects a parameter named 'json'.
-                    # The value of 'json' must be a JSON string containing the 'batchOrder' array.
-                    
-                    # 1. Create the wrapper structure
+                    # Wrap in json parameter
                     wrapper = {"batchOrder": orders_to_send}
-                    
-                    # 2. Dump to JSON string
-                    json_string = json.dumps(wrapper)
-                    
-                    # 3. Create the final payload key-value pair
-                    payload = {"json": json_string}
+                    payload = {"json": json.dumps(wrapper)}
                     
                     resp = self.kf.batch_order(payload)
                     
                     if "batchStatus" in resp:
                          statuses = resp.get("batchStatus", [])
                          for i, res in enumerate(statuses):
-                             if "order_id" in res:
+                             if "orderId" in res:
+                                 logger.info(f"Order {i+1} OK: {res['orderId']}")
+                             elif "order_id" in res:
+                                 # Sometimes mapped differently
                                  logger.info(f"Order {i+1} OK: {res['order_id']}")
                              else:
                                  logger.error(f"Order {i+1} Failed: {res}")
@@ -229,7 +217,6 @@ class CopyBot:
             except Exception as e:
                 logger.error(f"Loop Exception: {e}")
 
-            # Sleep 60 seconds
             time.sleep(60)
 
 if __name__ == "__main__":
