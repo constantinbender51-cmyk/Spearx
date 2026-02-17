@@ -11,7 +11,7 @@ import os
 import sys
 import time
 import logging
-import math
+import json  # <--- Added import
 from typing import Dict, Any
 
 # --- Local Imports ---
@@ -32,7 +32,6 @@ KEY = os.getenv("KRAKEN_FUTURES_KEY")
 SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Symbols (Must be correct Kraken Futures identifiers)
-# Usually 'PF_' denotes Perpetual Futures (Linear/Vanilla)
 SOURCE_SYMBOL = "PF_XBTUSD"
 TARGET_SYMBOLS = ["PF_PEPEUSD", "PF_XRPUSD"]
 
@@ -123,7 +122,7 @@ class CopyBot:
 
                 # --- 1. Analyze Source (BTC) ---
                 if SOURCE_SYMBOL not in prices:
-                    logger.warning(f"Price for {SOURCE_SYMBOL} not found. Skipping.")
+                    logger.warning(f"Price for {SOURCE_SYMBOL} not found. Skipping cycle.")
                     time.sleep(10)
                     continue
 
@@ -131,11 +130,9 @@ class CopyBot:
                 btc_price = prices[SOURCE_SYMBOL]
                 
                 # Calculate Notional Value (Size * Price)
-                # Note: This assumes Linear Futures. If Inverse, math is distinct.
-                # PF_ usually implies Linear/Vanilla on Kraken.
                 btc_value_usd = btc_size * btc_price
 
-                logger.info(f"Source {SOURCE_SYMBOL}: Size {btc_size} | Value ${btc_value_usd:.2f}")
+                logger.info(f"Source {SOURCE_SYMBOL}: Size {btc_size:.4f} | Value ${btc_value_usd:.2f}")
 
                 # --- 2. Check Targets ---
                 orders_to_send = []
@@ -148,8 +145,7 @@ class CopyBot:
                     target_price = prices[target_sym]
                     current_qty = positions.get(target_sym, 0.0)
 
-                    # Calculate Desired Quantity
-                    # Target Value should match BTC Value exactly
+                    # Calculate Desired Quantity (Target Value == BTC Value)
                     desired_value_usd = btc_value_usd 
                     raw_target_qty = desired_value_usd / target_price
                     
@@ -182,9 +178,8 @@ class CopyBot:
                         trade_size = target_qty - current_qty
                         side = "buy" if trade_size > 0 else "sell"
                         
-                        # Ensure trade size is valid (not zero after rounding)
                         abs_size = abs(trade_size)
-                        # Re-round the delta to be safe
+                        # Re-round the delta to be safe (ensure it meets lot size)
                         abs_size = self._round_to_lot(target_sym, abs_size)
 
                         if abs_size > 0:
@@ -192,26 +187,30 @@ class CopyBot:
                             
                             orders_to_send.append({
                                 "orderType": "mkt",
-                                "symbol": target_sym.lower(), # API expects lowercase usually
+                                "symbol": target_sym.lower(), 
                                 "side": side,
                                 "size": abs_size
                             })
                     else:
-                        # Optional: Log 'Holding' status occasionally
-                        # logger.info(f"Holding {target_sym}. Deviation within limits.")
                         pass
 
                 # --- 5. Execute Batch ---
                 if orders_to_send:
                     logger.info(f"Sending {len(orders_to_send)} orders...")
-                    resp = self.kf.batch_order({"batchOrder": orders_to_send})
+                    
+                    # --- FIX: Serialize list to JSON string for API ---
+                    batch_payload = {"batchOrder": json.dumps(orders_to_send)}
+                    
+                    resp = self.kf.batch_order(batch_payload)
                     
                     if "batchStatus" in resp:
-                         logger.info(f"Batch Result: {resp['batchStatus']}")
-                         # Detailed error logging
-                         for res in resp.get("batchStatus", []):
-                             if "error" in res:
-                                 logger.error(f"Order Error: {res}")
+                         # Log results
+                         statuses = resp.get("batchStatus", [])
+                         for i, res in enumerate(statuses):
+                             if "order_id" in res:
+                                 logger.info(f"Order {i+1} OK: {res['order_id']}")
+                             else:
+                                 logger.error(f"Order {i+1} Failed: {res}")
                     else:
                         logger.error(f"Batch failed: {resp}")
                 else:
