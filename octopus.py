@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Octopus Trend: Execution Engine for ETH Trend Strategy
-- Logic: Long ETH if BTC Price > 365-period BTC SMA, else Short ETH.
-- Source: Binance (BTCUSDT) for OHLC/SMA.
-- Execution: Kraken Futures (ETHUSD).
-- Interval: 5 Minutes
-- Sizing: 1x Margin Equity
-- Filter: Updates only if position delta > 10%
+Kraken Futures Copy Bot
+1. Monitors BTC Perpetual position (Source).
+2. Maintains equal Notional Value (USD) in PEPE and XRP Perps (Targets).
+3. Rebalances only if the required position size deviates > 10% from actual.
+4. Checks once per minute.
 """
 
 import os
 import sys
 import time
 import logging
-import requests
-import numpy as np
+import math
+from typing import Dict, Any
 
 # --- Local Imports ---
 try:
@@ -30,198 +28,202 @@ try:
 except ImportError:
     pass
 
-# API Keys
-KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
-KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
+KEY = os.getenv("KRAKEN_FUTURES_KEY")
+SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
-# Strategy Settings
-TRADE_SYMBOL = "FF_ETHUSD_260626"
-SIGNAL_SYMBOL = "BTCUSDT"    # Binance Symbol
-SMA_PERIOD = 365             # 365 hours
-LEVERAGE = 5        # 1x Equity
-UPDATE_INTERVAL = 300        # 5 Minutes
+# Symbols (Must be correct Kraken Futures identifiers)
+# Usually 'PF_' denotes Perpetual Futures (Linear/Vanilla)
+SOURCE_SYMBOL = "PF_XBTUSD"
+TARGET_SYMBOLS = ["PF_PEPEUSD", "PF_XRPUSD"]
 
-# Logging
+# Threshold (10%)
+REBALANCE_THRESHOLD = 0.10
+
+# Logging Setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("trend_octopus.log"), logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("OctopusTrend")
+logger = logging.getLogger("CopyBot")
 
-class OctopusTrendBot:
+class CopyBot:
     def __init__(self):
-        self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
-        self.min_size = 0.01
+        if not KEY or not SECRET:
+            logger.error("Missing API Key/Secret in environment variables.")
+            sys.exit(1)
+            
+        self.kf = KrakenFuturesApi(KEY, SECRET)
+        self.specs = {} # Stores lot sizes and precisions
 
     def initialize(self):
-        logger.info("--- Initializing Octopus Trend Bot (Binance Data Source) ---")
+        """Fetch instrument specs to ensure we send valid order sizes."""
+        logger.info("Fetching instrument specifications...")
         try:
-            acc = self.kf.get_accounts()
-            if "error" in acc:
-                logger.error(f"API Error: {acc}")
-                sys.exit(1)
-            
-            self._fetch_specs()
-            
-        except Exception as e:
-            logger.error(f"Startup Failed: {e}")
-            sys.exit(1)
-
-    def _fetch_specs(self):
-        try:
-            url = "https://futures.kraken.com/derivatives/api/v3/instruments"
-            resp = requests.get(url).json()
+            resp = self.kf.get_instruments()
             if "instruments" in resp:
                 for inst in resp["instruments"]:
-                    if inst["symbol"].upper() == TRADE_SYMBOL:
-                        precision = inst.get("contractValueTradePrecision", 2)
-                        self.min_size = 10 ** (-int(precision))
-                        logger.info(f"ETH Specs | Min Size: {self.min_size}")
-                        break
+                    sym = inst["symbol"].upper()
+                    self.specs[sym] = {
+                        "lotSize": float(inst.get("lotSize", 1.0)),
+                        "tickSize": float(inst.get("tickSize", 0.0001))
+                    }
+                logger.info(f"Loaded specs for {len(self.specs)} instruments.")
+            else:
+                logger.error("Failed to load instruments.")
+                sys.exit(1)
         except Exception as e:
-            logger.warning(f"Spec fetch failed, using defaults: {e}")
+            logger.error(f"Initialization Error: {e}")
+            sys.exit(1)
 
-    def get_btc_sma_state(self):
+    def _round_to_lot(self, symbol: str, quantity: float) -> float:
+        """Rounds a quantity to the nearest valid lot size for the symbol."""
+        symbol = symbol.upper()
+        if symbol not in self.specs:
+            return quantity
+        
+        lot_size = self.specs[symbol]["lotSize"]
+        # Round to nearest lot
+        steps = round(quantity / lot_size)
+        return steps * lot_size
+
+    def get_market_data(self):
+        """Fetches current positions and market prices."""
         try:
-            url = "https://api.binance.com/api/v3/klines"
-            params = {
-                "symbol": SIGNAL_SYMBOL,
-                "interval": "1h",
-                "limit": 500
-            }
-            resp = requests.get(url, params=params, timeout=10)
-            data = resp.json()
+            # 1. Get Positions
+            pos_resp = self.kf.get_open_positions()
+            positions = {}
+            if "openPositions" in pos_resp:
+                for p in pos_resp["openPositions"]:
+                    s = float(p["size"])
+                    if p["side"] == "short":
+                        s = -s
+                    positions[p["symbol"].upper()] = s
             
-            if isinstance(data, dict) and "code" in data:
-                logger.error(f"Binance API Error: {data}")
-                return None, None, None
-
-            # Index 4 is Close
-            closes = np.array([float(candle[4]) for candle in data])
-
-            if len(closes) < SMA_PERIOD:
-                logger.warning(f"Insufficient Data: {len(closes)}/{SMA_PERIOD}")
-                return None, None, None
-
-            sma = np.mean(closes[-SMA_PERIOD:])
-            current_price = closes[-1]
-
-            is_bullish = current_price > sma
-            return current_price, sma, is_bullish
-
+            # 2. Get Prices
+            tick_resp = self.kf.get_tickers()
+            prices = {}
+            if "tickers" in tick_resp:
+                for t in tick_resp["tickers"]:
+                    prices[t["symbol"].upper()] = float(t["markPrice"])
+            
+            return positions, prices
         except Exception as e:
-            logger.error(f"Signal Logic Error: {e}")
-            return None, None, None
-
-    def get_equity(self):
-        try:
-            acc = self.kf.get_accounts()
-            if "flex" in acc.get("accounts", {}):
-                return float(acc["accounts"]["flex"].get("marginEquity", 0))
-            first = list(acc.get("accounts", {}).values())[0]
-            return float(first.get("marginEquity", 0))
-        except Exception:
-            return 0.0
-
-    def get_current_position(self):
-        try:
-            pos = self.kf.get_open_positions()
-            for p in pos.get("openPositions", []):
-                if p["symbol"].upper() == TRADE_SYMBOL:
-                    size = float(p["size"])
-                    return size if p["side"] == "long" else -size
-            return 0.0
-        except Exception:
-            return 0.0
-
-    def _round_size(self, size):
-        steps = size / self.min_size
-        return round(steps) * self.min_size
+            logger.error(f"API Error fetching data: {e}")
+            return {}, {}
 
     def run(self):
-        logger.info(f"Bot Running. Cycle: {UPDATE_INTERVAL}s. Filter: >10% Delta.")
-        
+        logger.info(f"--- Bot Started ---")
+        logger.info(f"Source: {SOURCE_SYMBOL} | Targets: {TARGET_SYMBOLS}")
+        logger.info(f"Update Interval: 60s | Threshold: {REBALANCE_THRESHOLD*100}%")
+
         while True:
             try:
-                # 1. Equity Check
-                equity = self.get_equity()
-                if equity <= 0:
-                    logger.error("Equity 0 or Fetch Fail.")
-                    time.sleep(60)
+                positions, prices = self.get_market_data()
+
+                # --- 1. Analyze Source (BTC) ---
+                if SOURCE_SYMBOL not in prices:
+                    logger.warning(f"Price for {SOURCE_SYMBOL} not found. Skipping.")
+                    time.sleep(10)
                     continue
 
-                # 2. Strategy Logic (Binance)
-                btc_price, sma, bull = self.get_btc_sma_state()
-                if btc_price is None:
-                    time.sleep(60)
-                    continue
-
-                logger.info(f"State | BTC: {btc_price:.2f} | SMA({SMA_PERIOD}): {sma:.2f} | Bias: {'LONG' if bull else 'SHORT'}")
-
-                # 3. Sizing
-                eth_tickers = self.kf.get_tickers()
-                eth_price = 0.0
-                for t in eth_tickers.get("tickers", []):
-                    if t["symbol"].upper() == TRADE_SYMBOL:
-                        eth_price = float(t["markPrice"])
-                        break
+                btc_size = positions.get(SOURCE_SYMBOL, 0.0)
+                btc_price = prices[SOURCE_SYMBOL]
                 
-                if eth_price == 0:
-                    logger.error("ETH Price unavailable.")
-                    continue
+                # Calculate Notional Value (Size * Price)
+                # Note: This assumes Linear Futures. If Inverse, math is distinct.
+                # PF_ usually implies Linear/Vanilla on Kraken.
+                btc_value_usd = btc_size * btc_price
 
-                target_value = equity * LEVERAGE
-                target_qty = target_value / eth_price
-                
-                if not bull:
-                    target_qty = -target_qty
+                logger.info(f"Source {SOURCE_SYMBOL}: Size {btc_size} | Value ${btc_value_usd:.2f}")
 
-                target_qty = self._round_size(target_qty)
-                current_qty = self.get_current_position()
+                # --- 2. Check Targets ---
+                orders_to_send = []
 
-                # 4. Filter Logic (10% Threshold)
-                should_trade = False
-                
-                if abs(current_qty) == 0:
-                    # If flat, trade if target exists
-                    should_trade = abs(target_qty) >= self.min_size
-                elif abs(target_qty) < self.min_size:
-                    # If target is 0 (exit), always trade if currently open
-                    should_trade = abs(current_qty) >= self.min_size
-                else:
-                    # Calculate delta percentage relative to current size
-                    delta = abs(target_qty - current_qty)
-                    pct_change = delta / abs(current_qty)
+                for target_sym in TARGET_SYMBOLS:
+                    if target_sym not in prices:
+                        logger.warning(f"Price for {target_sym} not found. Skipping.")
+                        continue
+
+                    target_price = prices[target_sym]
+                    current_qty = positions.get(target_sym, 0.0)
+
+                    # Calculate Desired Quantity
+                    # Target Value should match BTC Value exactly
+                    desired_value_usd = btc_value_usd 
+                    raw_target_qty = desired_value_usd / target_price
                     
-                    if pct_change > 0.10:
-                        should_trade = True
-                    else:
-                        logger.info(f"Delta {pct_change*100:.2f}% < 10%. Holding.")
+                    # Rounding
+                    target_qty = self._round_to_lot(target_sym, raw_target_qty)
 
-                # 5. Execution
-                if should_trade:
-                    diff = target_qty - current_qty
-                    if abs(diff) >= self.min_size:
-                        side = "buy" if diff > 0 else "sell"
-                        logger.info(f"EXECUTE | Curr: {current_qty} -> Targ: {target_qty} | Side: {side} {abs(diff):.4f}")
+                    # --- 3. Deviation Logic ---
+                    should_trade = False
+                    
+                    # Scenario A: We have 0, but want some (BTC position exists)
+                    if current_qty == 0 and abs(target_qty) > 0:
+                        should_trade = True
+                    
+                    # Scenario B: We have some, but want 0 (BTC position closed)
+                    elif current_qty != 0 and target_qty == 0:
+                        should_trade = True
                         
-                        self.kf.send_order({
-                            "orderType": "mkt",
-                            "symbol": TRADE_SYMBOL.lower(),
-                            "side": side,
-                            "size": abs(diff)
-                        })
+                    # Scenario C: We have some, compare deviation
+                    elif current_qty != 0:
+                        diff = target_qty - current_qty
+                        pct_deviation = abs(diff) / abs(current_qty)
+                        if pct_deviation > REBALANCE_THRESHOLD:
+                            should_trade = True
+                        else:
+                            pass # Deviation too small
+
+                    # --- 4. Prepare Order ---
+                    if should_trade:
+                        # Calculate trade size (delta)
+                        trade_size = target_qty - current_qty
+                        side = "buy" if trade_size > 0 else "sell"
+                        
+                        # Ensure trade size is valid (not zero after rounding)
+                        abs_size = abs(trade_size)
+                        # Re-round the delta to be safe
+                        abs_size = self._round_to_lot(target_sym, abs_size)
+
+                        if abs_size > 0:
+                            logger.info(f"REBALANCE {target_sym}: Curr {current_qty} -> Targ {target_qty} | Delta: {side.upper()} {abs_size}")
+                            
+                            orders_to_send.append({
+                                "orderType": "mkt",
+                                "symbol": target_sym.lower(), # API expects lowercase usually
+                                "side": side,
+                                "size": abs_size
+                            })
                     else:
-                        logger.info("Diff below min_size. Skipping.")
+                        # Optional: Log 'Holding' status occasionally
+                        # logger.info(f"Holding {target_sym}. Deviation within limits.")
+                        pass
+
+                # --- 5. Execute Batch ---
+                if orders_to_send:
+                    logger.info(f"Sending {len(orders_to_send)} orders...")
+                    resp = self.kf.batch_order({"batchOrder": orders_to_send})
+                    
+                    if "batchStatus" in resp:
+                         logger.info(f"Batch Result: {resp['batchStatus']}")
+                         # Detailed error logging
+                         for res in resp.get("batchStatus", []):
+                             if "error" in res:
+                                 logger.error(f"Order Error: {res}")
+                    else:
+                        logger.error(f"Batch failed: {resp}")
+                else:
+                    logger.info("No rebalance needed.")
 
             except Exception as e:
-                logger.error(f"Loop Error: {e}")
+                logger.error(f"Loop Exception: {e}")
 
-            logger.info(f"Sleeping {UPDATE_INTERVAL/60:.1f} min...")
-            time.sleep(UPDATE_INTERVAL)
+            # Sleep 60 seconds
+            time.sleep(60)
 
 if __name__ == "__main__":
-    bot = OctopusTrendBot()
+    bot = CopyBot()
     bot.initialize()
     bot.run()
