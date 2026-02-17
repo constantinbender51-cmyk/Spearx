@@ -11,7 +11,7 @@ import os
 import sys
 import time
 import logging
-import json  # <--- Added import
+import json
 from typing import Dict, Any
 
 # --- Local Imports ---
@@ -82,6 +82,9 @@ class CopyBot:
             return quantity
         
         lot_size = self.specs[symbol]["lotSize"]
+        # Avoid division by zero
+        if lot_size == 0: return quantity
+        
         # Round to nearest lot
         steps = round(quantity / lot_size)
         return steps * lot_size
@@ -155,22 +158,22 @@ class CopyBot:
                     # --- 3. Deviation Logic ---
                     should_trade = False
                     
-                    # Scenario A: We have 0, but want some (BTC position exists)
+                    # Scenario A: We have 0, but want some
                     if current_qty == 0 and abs(target_qty) > 0:
                         should_trade = True
                     
-                    # Scenario B: We have some, but want 0 (BTC position closed)
+                    # Scenario B: We have some, but want 0
                     elif current_qty != 0 and target_qty == 0:
                         should_trade = True
                         
-                    # Scenario C: We have some, compare deviation
+                    # Scenario C: Deviation check
                     elif current_qty != 0:
                         diff = target_qty - current_qty
                         pct_deviation = abs(diff) / abs(current_qty)
                         if pct_deviation > REBALANCE_THRESHOLD:
                             should_trade = True
                         else:
-                            pass # Deviation too small
+                            pass 
 
                     # --- 4. Prepare Order ---
                     if should_trade:
@@ -179,7 +182,7 @@ class CopyBot:
                         side = "buy" if trade_size > 0 else "sell"
                         
                         abs_size = abs(trade_size)
-                        # Re-round the delta to be safe (ensure it meets lot size)
+                        # Re-round the delta to be safe
                         abs_size = self._round_to_lot(target_sym, abs_size)
 
                         if abs_size > 0:
@@ -191,20 +194,27 @@ class CopyBot:
                                 "side": side,
                                 "size": abs_size
                             })
-                    else:
-                        pass
 
                 # --- 5. Execute Batch ---
                 if orders_to_send:
                     logger.info(f"Sending {len(orders_to_send)} orders...")
                     
-                    # --- FIX: Serialize list to JSON string for API ---
-                    batch_payload = {"batchOrder": json.dumps(orders_to_send)}
+                    # --- CRITICAL FIX ---
+                    # The API expects a parameter named 'json'.
+                    # The value of 'json' must be a JSON string containing the 'batchOrder' array.
                     
-                    resp = self.kf.batch_order(batch_payload)
+                    # 1. Create the wrapper structure
+                    wrapper = {"batchOrder": orders_to_send}
+                    
+                    # 2. Dump to JSON string
+                    json_string = json.dumps(wrapper)
+                    
+                    # 3. Create the final payload key-value pair
+                    payload = {"json": json_string}
+                    
+                    resp = self.kf.batch_order(payload)
                     
                     if "batchStatus" in resp:
-                         # Log results
                          statuses = resp.get("batchStatus", [])
                          for i, res in enumerate(statuses):
                              if "order_id" in res:
