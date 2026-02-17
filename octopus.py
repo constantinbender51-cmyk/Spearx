@@ -38,6 +38,9 @@ TARGET_SYMBOLS = ["PF_PEPEUSD", "PF_XRPUSD"]
 # Threshold (10%)
 REBALANCE_THRESHOLD = 0.10
 
+# Slippage for Limit Orders (mimic market order)
+SLIPPAGE = 0.02
+
 # Logging Setup
 logging.basicConfig(
     level=logging.INFO,
@@ -76,17 +79,22 @@ class CopyBot:
             sys.exit(1)
 
     def _round_to_lot(self, symbol: str, quantity: float) -> float:
-        """Rounds a quantity to the nearest valid lot size for the symbol."""
+        """Rounds a quantity to the nearest valid lot size."""
         symbol = symbol.upper()
         if symbol not in self.specs:
             return quantity
-        
         lot_size = self.specs[symbol]["lotSize"]
         if lot_size == 0: return quantity
-        
-        # Round to nearest lot
-        steps = round(quantity / lot_size)
-        return steps * lot_size
+        return round(quantity / lot_size) * lot_size
+
+    def _round_to_tick(self, symbol: str, price: float) -> float:
+        """Rounds a price to the nearest valid tick size."""
+        symbol = symbol.upper()
+        if symbol not in self.specs:
+            return price
+        tick_size = self.specs[symbol]["tickSize"]
+        if tick_size == 0: return price
+        return round(price / tick_size) * tick_size
 
     def get_market_data(self):
         """Fetches current positions and market prices."""
@@ -130,8 +138,6 @@ class CopyBot:
 
                 btc_size = positions.get(SOURCE_SYMBOL, 0.0)
                 btc_price = prices[SOURCE_SYMBOL]
-                
-                # Calculate Notional Value (Size * Price)
                 btc_value_usd = btc_size * btc_price
 
                 logger.info(f"Source {SOURCE_SYMBOL}: Size {btc_size:.4f} | Value ${btc_value_usd:.2f}")
@@ -150,8 +156,6 @@ class CopyBot:
                     # Calculate Desired Quantity
                     desired_value_usd = btc_value_usd 
                     raw_target_qty = desired_value_usd / target_price
-                    
-                    # Rounding
                     target_qty = self._round_to_lot(target_sym, raw_target_qty)
 
                     # --- 3. Deviation Logic ---
@@ -176,16 +180,25 @@ class CopyBot:
                         abs_size = self._round_to_lot(target_sym, abs_size)
 
                         if abs_size > 0:
-                            logger.info(f"REBALANCE {target_sym}: Curr {current_qty} -> Targ {target_qty} | Delta: {side.upper()} {abs_size}")
+                            # Calculate LIMIT PRICE (Market-like)
+                            # Buy: Price + 2%, Sell: Price - 2%
+                            if side == "buy":
+                                raw_price = target_price * (1 + SLIPPAGE)
+                            else:
+                                raw_price = target_price * (1 - SLIPPAGE)
                             
-                            # --- FIXED: Added 'order' and 'order_tag' ---
+                            limit_price = self._round_to_tick(target_sym, raw_price)
+
+                            logger.info(f"REBALANCE {target_sym}: Curr {current_qty} -> Targ {target_qty} | {side.upper()} {abs_size} @ {limit_price}")
+                            
                             orders_to_send.append({
-                                "order": "send",             # <--- REQUIRED: Specifies action type
-                                "order_tag": "copy_bot",     # <--- REQUIRED: Arbitrary tag
-                                "orderType": "mkt",
-                                "symbol": target_sym.lower(), 
+                                "order": "send",
+                                "order_tag": "copy_bot",
+                                "orderType": "lmt",          # <--- CHANGED to LIMIT
+                                "symbol": target_sym.lower(),
                                 "side": side,
-                                "size": abs_size,
+                                "size": str(abs_size),       # Send as string
+                                "limitPrice": str(limit_price), # Send as string
                                 "cliOrdId": f"cb_{int(time.time()*1000)}_{target_sym[-3:]}"
                             })
 
@@ -193,7 +206,6 @@ class CopyBot:
                 if orders_to_send:
                     logger.info(f"Sending {len(orders_to_send)} orders...")
                     
-                    # Wrap in json parameter
                     wrapper = {"batchOrder": orders_to_send}
                     payload = {"json": json.dumps(wrapper)}
                     
@@ -205,7 +217,6 @@ class CopyBot:
                              if "orderId" in res:
                                  logger.info(f"Order {i+1} OK: {res['orderId']}")
                              elif "order_id" in res:
-                                 # Sometimes mapped differently
                                  logger.info(f"Order {i+1} OK: {res['order_id']}")
                              else:
                                  logger.error(f"Order {i+1} Failed: {res}")
